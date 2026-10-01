@@ -18,9 +18,14 @@ VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
 BUILD=$(git rev-list --count HEAD 2>/dev/null || echo 1)
 APP=dist/Petal.app
 
-cargo build --release
+# Rust embeds source paths (for panic messages); keep this machine's paths out of the
+# shipped binary. Its own target directory, so the different flags don't force normal
+# builds to recompile.
+# (The encoded form, separated by 0x1f, copes with spaces in the paths.)
+export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$HOME=/build"$'\x1f'"--remap-path-prefix=$PWD=/petal"
+cargo build --release --target-dir target/bundle
 rm -rf "$APP" && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp target/release/petal "$APP/Contents/MacOS/petal"
+cp target/bundle/release/petal "$APP/Contents/MacOS/petal"
 [[ -f packaging/AppIcon.icns ]] || python3 scripts/make-icon.py packaging
 cp packaging/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 sed -e "s/__VERSION__/$VERSION/" -e "s/__BUILD__/$BUILD/" packaging/Info.plist > "$APP/Contents/Info.plist"
