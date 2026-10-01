@@ -68,9 +68,21 @@ will free.
 
 ## Install
 
-There are no signed downloads yet, so for now you build Petal yourself. It takes about two minutes.
+### Download
 
-**You need:** macOS 13 or later, the Xcode Command Line Tools (`xcode-select --install`), and
+**[Download Petal 0.1.0 (DMG, 5.5 MB)](https://github.com/henrydennis/petal/releases/latest/download/Petal-0.1.0.dmg)** for Macs
+with Apple silicon (M1 or later) running macOS 13 or later.
+
+1. Open the DMG and drag **Petal** into **Applications**.
+2. Open Petal. This build isn't notarized by Apple yet, so macOS says it can't verify the app. Click
+   **Done**, then open **System Settings › Privacy & Security**, scroll down and click **Open Anyway**
+   next to the message about Petal. You only need to do this once.
+
+All releases are on the [Releases page](https://github.com/henrydennis/petal/releases).
+
+### Build from source
+
+It takes a couple of minutes. **You need:** macOS 13 or later, the Xcode Command Line Tools (`xcode-select --install`), and
 [Rust](https://rustup.rs). The repository pins the toolchain in `rust-toolchain.toml`, so `rustup`
 fetches the right version automatically.
 
@@ -82,7 +94,8 @@ git clone https://github.com/henrydennis/petal.git
 cd petal && scripts/bundle.sh
 ```
 
-That builds `dist/Petal.app` (ad-hoc signed, for this Mac). Drag it into **Applications** and open it.
+That builds `dist/Petal.app` (signed ad hoc, so it runs on the Mac that built it). Drag it into
+**Applications** and open it.
 `scripts/bundle.sh --dmg` also makes a disk image.
 
 Or run it straight from the source tree:
