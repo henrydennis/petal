@@ -17,8 +17,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/henrydennis/petal/blob/main/docs/petal.mp4"><img src="docs/video-poster.jpg" width="820" alt="Petal in 50 seconds: play the video"></a><br>
-  <sub>▶ <b><a href="https://github.com/henrydennis/petal/blob/main/docs/petal.mp4">Watch Petal in 50 seconds</a></b> (with sound)</sub>
+  <a href="https://cdn.jsdelivr.net/gh/henrydennis/petal@main/docs/petal.mp4"><img src="docs/video-poster.jpg" width="820" alt="Petal in 50 seconds: play the video"></a><br>
+  <sub>▶ <b><a href="https://cdn.jsdelivr.net/gh/henrydennis/petal@main/docs/petal.mp4">Watch Petal in 50 seconds</a></b> (with sound)</sub>
 </p>
 
 ---
