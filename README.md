@@ -11,6 +11,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/henrydennis/petal/actions/workflows/ci.yml"><img src="https://github.com/henrydennis/petal/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/macOS-13%2B-black?logo=apple" alt="macOS 13+">
   <img src="https://img.shields.io/badge/Rust-1.95%2B-orange?logo=rust" alt="Rust 1.95+">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
