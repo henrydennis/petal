@@ -1159,7 +1159,7 @@ mod tests {
         };
         let plain = scan_with_bases(&dir, &Progress::default(), &findings::Bases::default());
         let progress = Progress::default();
-        let spliced = scan_with_bases(&dir, &progress, &findings::Bases { home: Some(home.clone()), user_temp: None });
+        let spliced = scan_with_bases(&dir, &progress, &findings::Bases { home: Some(home.clone()), user_temp: None, protected: Vec::new() });
         assert_eq!(fingerprint(&plain), fingerprint(&spliced));
         let live = crate::live::snapshot(&progress.live, &dir, None).tree;
         assert_eq!(live.nodes[Tree::ROOT].size, spliced.nodes[Tree::ROOT].size, "live totals");
