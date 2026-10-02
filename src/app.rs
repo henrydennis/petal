@@ -41,7 +41,6 @@ const ACCENT: u32 = 0x4f9dff;
 const DANGER: u32 = 0xe5484d;
 
 const ROW_HEIGHT: f32 = 30.0;
-const ZOOM_DURATION: Duration = Duration::from_millis(450);
 
 /// How the chart is coloured.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -88,29 +87,25 @@ struct Scanning {
     expected: Option<u64>,
     live: Option<Rc<LiveView>>,
     last_snapshot: Instant,
-    /// Folder being looked at mid-scan, by name path from the root, so it survives the
-    /// re-snapshots (node indices change between them).
-    focus: Vec<SharedString>,
-    hover: Option<Vec<SharedString>>,
     chart_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     eta: eta::Eta,
-    finals: HashMap<Vec<SharedString>, Instant>,
     /// Segments ease between snapshots instead of jumping.
     motion: Rc<std::cell::RefCell<motion::ChartMotion>>,
     _tasks: [Task<()>; 2],
 }
 
-/// A snapshot of the running totals, laid out around the folder in focus.
+/// A snapshot of the running totals, laid out. The scan's chart is look-only: the mouse
+/// does nothing until the results are up, so nothing under the pointer changes as the
+/// chart grows beneath it.
 struct LiveView {
     tree: Tree,
     /// Which folders are final, indexed like `tree.nodes`.
     done: Vec<bool>,
-    focus: usize,
     segments: Rc<Vec<Segment>>,
     swatches: HashMap<usize, Hsla>,
     /// The "not scanned yet" slice of the startup disk, drawn pulsing.
     pending: Option<usize>,
-    /// When each recently finalised folder became final, so it can glow briefly.
+    /// When each recently finalised folder became final, so it can ease into full colour.
     settled_at: HashMap<usize, Instant>,
     /// Each segment's identity (folder path), aligned with `segments`, for smooth motion.
     keys: Vec<motion::Key>,
@@ -125,32 +120,29 @@ static NEXT_RESULTS_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 const WATCH_INTERVAL: Duration = Duration::from_secs(1);
 
 const LIVE_REFRESH: Duration = Duration::from_millis(100);
-/// How long a folder glows after its total becomes final.
-const SETTLE_GLOW: Duration = Duration::from_millis(700);
+/// How long a folder takes to ease into full colour once its total is final.
+const SETTLE_FADE: Duration = Duration::from_millis(600);
 /// How long the "scan complete" banner stays up.
 const BANNER_TIME: Duration = Duration::from_secs(8);
 
 impl LiveView {
-    /// `finals` remembers when each folder (by path) was first seen final, across snapshots.
-    fn new(snapshot: live::LiveSnapshot, focus_path: &[SharedString], finals: &mut HashMap<Vec<SharedString>, Instant>) -> Self {
-        let live::LiveSnapshot { tree, done } = snapshot;
+    fn new(snapshot: live::LiveSnapshot) -> Self {
+        let live::LiveSnapshot { tree, done, settled } = snapshot;
         let pending = tree.nodes[Tree::ROOT]
             .children
             .iter()
             .copied()
             .find(|&c| tree.nodes[c].kind == Kind::Other && tree.nodes[c].name.as_ref() == disk::NOT_SCANNED);
         let now = clock::now();
-        let mut settled_at = HashMap::new();
-        for ix in (0..tree.nodes.len()).filter(|&ix| done[ix] && tree.nodes[ix].kind == Kind::Dir && ix != Tree::ROOT) {
-            let at = *finals.entry(path_to(&tree, ix)).or_insert(now);
-            if now - at < SETTLE_GLOW {
-                settled_at.insert(ix, at);
-            }
-        }
+        let settled_at = settled
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, at)| Some((ix, (*at)?)))
+            .filter(|&(ix, at)| tree.nodes[ix].kind == Kind::Dir && ix != Tree::ROOT && now - at < SETTLE_FADE)
+            .collect();
         let mut view = Self {
             tree,
             done,
-            focus: Tree::ROOT,
             segments: Rc::default(),
             swatches: HashMap::new(),
             pending,
@@ -158,13 +150,12 @@ impl LiveView {
             keys: Vec::new(),
             id: 0,
         };
-        view.refocus(focus_path);
+        view.lay_out();
         view
     }
 
-    fn refocus(&mut self, focus_path: &[SharedString]) {
-        self.focus = resolve_path(&self.tree, focus_path);
-        let segments = sunburst::layout(&self.tree, self.focus);
+    fn lay_out(&mut self) {
+        let segments = sunburst::layout(&self.tree, Tree::ROOT);
         self.swatches = segments
             .iter()
             .filter_map(|s| match s.target {
@@ -176,7 +167,7 @@ impl LiveView {
             .iter()
             .map(|s| match s.target {
                 Target::Node(ix) => motion::Key::Node(path_to(&self.tree, ix)),
-                Target::Small { parent } => motion::Key::Small(path_to(&self.tree, parent)),
+                Target::Small { first, .. } => motion::Key::Small(path_to(&self.tree, first)),
             })
             .collect();
         self.segments = Rc::new(segments);
@@ -200,19 +191,6 @@ fn resolve_path(tree: &Tree, path: &[SharedString]) -> usize {
     at
 }
 
-/// Whether `ix` is `ancestor` or lies somewhere below it.
-fn is_within(tree: &Tree, mut ix: usize, ancestor: usize) -> bool {
-    loop {
-        if ix == ancestor {
-            return true;
-        }
-        match tree.nodes[ix].parent {
-            Some(parent) => ix = parent,
-            None => return false,
-        }
-    }
-}
-
 /// Folder names from the root down to `ix` (excluding the root itself).
 fn path_to(tree: &Tree, mut ix: usize) -> Vec<SharedString> {
     let mut names = Vec::new();
@@ -231,7 +209,12 @@ struct Results {
     swatches: HashMap<usize, Hsla>,
     chart_hover: Option<Hit>,
     list_hover: Option<usize>,
-    anim_start: Instant,
+    /// Each segment's identity (folder path), aligned with `segments`, for smooth motion.
+    keys: Rc<Vec<motion::Key>>,
+    /// Unique per layout, so the animation knows when to retarget.
+    layout_id: u64,
+    /// The chart morphs between layouts (carried over from the scan's live chart).
+    motion: Rc<std::cell::RefCell<motion::ChartMotion>>,
     chart_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     collector: Vec<usize>,
     list_scroll: UniformListScrollHandle,
@@ -275,7 +258,9 @@ impl Results {
             swatches: HashMap::new(),
             chart_hover: None,
             list_hover: None,
-            anim_start: clock::now(),
+            keys: Rc::default(),
+            layout_id: 0,
+            motion: Rc::default(),
             chart_bounds: Rc::default(),
             collector: Vec::new(),
             list_scroll: UniformListScrollHandle::new(),
@@ -317,7 +302,17 @@ impl Results {
                 _ => None,
             })
             .collect();
+        self.keys = Rc::new(
+            segments
+                .iter()
+                .map(|s| match s.target {
+                    Target::Node(ix) => motion::Key::Node(path_to(&self.tree, ix)),
+                    Target::Small { first, .. } => motion::Key::Small(path_to(&self.tree, first)),
+                })
+                .collect(),
+        );
         self.segments = Rc::new(segments);
+        self.layout_id = NEXT_LAYOUT_ID.fetch_add(1, Ordering::Relaxed);
     }
 
     fn set_color_by(&mut self, color_by: ColorBy) {
@@ -349,10 +344,10 @@ impl Results {
         if self.tree.nodes[ix].kind != Kind::Dir || ix == self.focus {
             return;
         }
+        self.motion.borrow_mut().zoom(motion::Camera::between(&self.tree, self.focus, ix));
         self.focus = ix;
         self.chart_hover = None;
         self.list_hover = None;
-        self.anim_start = clock::now();
         self.relayout();
         self.list_scroll.scroll_to_item(0, ScrollStrategy::Top);
     }
@@ -594,18 +589,15 @@ impl Petal {
                     .await;
                 this.update(cx, |this, cx| {
                     if !progress.cancelled.load(Ordering::Relaxed) {
-                        // Open the results where the user was looking during the scan.
-                        let focus = match &this.screen {
-                            Screen::Scanning(scanning) => scanning.focus.clone(),
-                            _ => Vec::new(),
+                        // Carry the chart on from where it is.
+                        let motion = match &this.screen {
+                            Screen::Scanning(scanning) => scanning.motion.clone(),
+                            _ => Default::default(),
                         };
                         let mut results = Results::new(tree, findings, clock::since(started), root_for_results, this.color_by);
-                        let ix = resolve_path(&results.tree, &focus);
-                        if ix != Tree::ROOT {
-                            results.navigate(ix);
-                        }
-                        // The chart is already on screen from the scan; don't replay the sweep.
-                        results.anim_start = clock::now() - ZOOM_DURATION;
+                        // The results are sorted by size, unlike the scan's chart: fold one away and open the other.
+                        motion.borrow_mut().fold();
+                        results.motion = motion;
                         results.banner = Some(clock::now());
                         results.watch = watch::Watch::start(&results.requested_root, since);
                         let id = results.id;
@@ -647,7 +639,7 @@ impl Petal {
                         let layout = scanning.progress.layout.get().map(|l| &**l);
                         let root = layout.map(|l| l.data_root.clone()).unwrap_or_else(|| scanning.root.clone());
                         let snapshot = live::snapshot(&scanning.progress.live, &root, layout);
-                        scanning.live = Some(Rc::new(LiveView::new(snapshot, &scanning.focus, &mut scanning.finals)));
+                        scanning.live = Some(Rc::new(LiveView::new(snapshot)));
                         scanning.last_snapshot = clock::now();
                     }
                     true
@@ -666,11 +658,8 @@ impl Petal {
             started,
             live: None,
             last_snapshot: started,
-            focus: Vec::new(),
-            hover: None,
             chart_bounds: Rc::default(),
             eta: eta::Eta::default(),
-            finals: HashMap::new(),
             motion: Rc::default(),
             _tasks: [scan_task, ticker],
         });
@@ -720,46 +709,6 @@ impl Petal {
         if let Screen::Results(r) = &mut self.screen {
             if let Some(parent) = r.tree.nodes[r.focus].parent {
                 r.navigate(parent);
-                cx.notify();
-            }
-        }
-    }
-
-    fn scanning(&mut self) -> Option<&mut Scanning> {
-        match &mut self.screen {
-            Screen::Scanning(s) => Some(s),
-            _ => None,
-        }
-    }
-
-    fn live_focus(&mut self, path: Vec<SharedString>, cx: &mut Context<Self>) {
-        if let Some(scanning) = self.scanning() {
-            scanning.focus = path;
-            scanning.hover = None;
-            // Re-lay out the current snapshot straight away rather than waiting for the next one.
-            if let Some(view) = scanning.live.take() {
-                let mut view = Rc::try_unwrap(view).unwrap_or_else(|rc| LiveView {
-                    tree: Tree { root_path: rc.tree.root_path.clone(), nodes: rc.tree.nodes.clone(), errors: 0, cloud_only: 0 },
-                    done: rc.done.clone(),
-                    focus: rc.focus,
-                    segments: rc.segments.clone(),
-                    swatches: rc.swatches.clone(),
-                    pending: rc.pending,
-                    settled_at: rc.settled_at.clone(),
-                    keys: rc.keys.clone(),
-                    id: rc.id,
-                });
-                view.refocus(&scanning.focus);
-                scanning.live = Some(Rc::new(view));
-            }
-            cx.notify();
-        }
-    }
-
-    fn live_hover(&mut self, path: Option<Vec<SharedString>>, cx: &mut Context<Self>) {
-        if let Some(scanning) = self.scanning() {
-            if scanning.hover != path {
-                scanning.hover = path;
                 cx.notify();
             }
         }
@@ -1047,7 +996,6 @@ impl Petal {
                             r.collector_frees.set(None);
                             r.chart_hover = None;
                             r.list_hover = None;
-                            r.anim_start = clock::now();
                             r.relayout();
                         }
                     }
@@ -1340,7 +1288,6 @@ impl Petal {
                 }
             }
         }
-        let hovered = view.as_ref().zip(scanning.hover.as_ref()).map(|(v, path)| resolve_path(&v.tree, path));
 
         // Honest sizes: final folders show their size, folders still being counted show a lower bound.
         let size_label = |view: &LiveView, ix: usize| -> String {
@@ -1354,36 +1301,13 @@ impl Petal {
             }
         };
 
-        // Sidebar: the focused folder's contents.
+        // Sidebar: what's in the folder being scanned.
         let mut rows = div().id("live-rows").flex_1().min_h_0().px_2().overflow_y_scroll().flex().flex_col();
-        let mut crumbs = None;
         if let Some(view) = &view {
-            let focus = &view.tree.nodes[view.focus];
-            if view.focus != Tree::ROOT {
-                let up = path_to(&view.tree, focus.parent.unwrap_or(Tree::ROOT));
-                crumbs = Some(
-                    div()
-                        .id("live-up")
-                        .px_4()
-                        .pb_2()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .text_color(rgb(MUTED))
-                        .cursor_pointer()
-                        .hover(|s| s.text_color(rgb(TEXT)))
-                        .child(format!("‹ {}", path_to(&view.tree, view.focus).iter().map(|n| n.to_string()).collect::<Vec<_>>().join(" › ")))
-                        .on_click(cx.listener(move |this, _, _, cx| this.live_focus(up.clone(), cx))),
-                );
-            }
-            for &ix in &focus.children {
+            for &ix in &view.tree.nodes[Tree::ROOT].children {
                 let node = &view.tree.nodes[ix];
                 let swatch = view.swatches.get(&ix).copied().unwrap_or(gpui::hsla(0., 0., 0.38, 1.));
                 let is_final = view.is_final(ix);
-                let is_hovered = hovered == Some(ix);
-                let openable = node.kind == Kind::Dir && !node.children.is_empty();
-                let path = path_to(&view.tree, ix);
-                let hover_path = path.clone();
                 rows = rows.child(
                     div()
                         .id(("live-row", ix))
@@ -1394,12 +1318,6 @@ impl Petal {
                         .items_center()
                         .gap_2()
                         .rounded_md()
-                        .when(is_hovered, |d| d.bg(rgb(CARD_HOVER)))
-                        .when(openable, |d| d.cursor_pointer())
-                        .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
-                            this.live_hover(hovering.then(|| hover_path.clone()), cx);
-                        }))
-                        .when(openable, |d| d.on_click(cx.listener(move |this, _, _, cx| this.live_focus(path.clone(), cx))))
                         .child(
                             div()
                                 .size(px(10.))
@@ -1414,8 +1332,7 @@ impl Petal {
                                 .text_xs()
                                 .text_color(if is_final { rgb(TEXT) } else { rgb(MUTED) })
                                 .child(size_label(view, ix)),
-                        )
-                        .child(div().w(px(10.)).flex_none().text_color(rgb(MUTED)).child(if openable { "›" } else { "" })),
+                        ),
                 );
             }
         }
@@ -1477,22 +1394,18 @@ impl Petal {
                             .child(current),
                     ),
             )
-            .children(scanning.focus.is_empty().then(|| self.render_access_card(None, cx)).flatten())
+            .children(self.render_access_card(None, cx))
             .when_some(
-                (scanning.focus.is_empty())
-                    .then(|| findings::early_findings(&progress.early_findings.lock().unwrap()))
-                    .filter(|f| !f.is_empty()),
+                Some(findings::early_findings(&progress.early_findings.lock().unwrap())).filter(|f| !f.is_empty()),
                 |d, early| d.child(self.render_findings(&early, false, cx)),
             )
-            .children(crumbs)
             .child(rows)
             .child(
                 div()
                     .p_3()
                     .flex()
-                    .justify_between()
+                    .justify_end()
                     .items_center()
-                    .child(div().text_xs().text_color(rgb(MUTED)).child("Click a folder to look inside"))
                     .child(button("cancel", "Cancel").on_click(cx.listener(|this, _, _, cx| this.cancel_scan(cx)))),
             );
 
@@ -1505,26 +1418,9 @@ impl Petal {
         let started = scanning.started;
         let motion = scanning.motion.clone();
         let bounds_cell = scanning.chart_bounds.clone();
-        let entity = cx.entity().downgrade();
 
-        // Centre label: whatever is under the pointer, else the folder in focus.
-        let (title, lines): (String, Vec<String>) = match (&view, hovered) {
-            (Some(v), Some(ix)) if ix != v.focus => {
-                let node = &v.tree.nodes[ix];
-                let state = match node.kind {
-                    Kind::Other if node.name.as_ref() == disk::NOT_SCANNED => "still to scan",
-                    Kind::Other => "exact, from APFS",
-                    _ if v.is_final(ix) => "final",
-                    _ => "still counting",
-                };
-                (node.name.to_string(), vec![size_label(v, ix), state.to_string()])
-            }
-            (Some(v), _) if v.focus != Tree::ROOT => {
-                let node = &v.tree.nodes[v.focus];
-                let state = if v.is_final(v.focus) { "final" } else { "still counting" };
-                (node.name.to_string(), vec![size_label(v, v.focus), state.to_string(), "↑ click to go back".into()])
-            }
-            _ => match &layout {
+        // Centre label: how far the scan has got.
+        let (title, lines): (String, Vec<String>) = match &layout {
                 Some(layout) => (
                     layout.name.clone(),
                     vec![
@@ -1539,11 +1435,9 @@ impl Petal {
                         None => "scanning…".to_string(),
                     }],
                 ),
-            },
         };
         let label_width = scanning.chart_bounds.get().map(|b| Geometry::new(b).inner_radius * 1.7).unwrap_or(140.);
         let paint_view = view.clone();
-        let hover_ix = hovered;
 
         let chart = div()
             .flex_1()
@@ -1551,11 +1445,8 @@ impl Petal {
             .relative()
             .child(
                 canvas(
-                    move |bounds, window, _| {
-                        bounds_cell.set(Some(bounds));
-                        window.insert_hitbox(bounds, HitboxBehavior::Normal)
-                    },
-                    move |bounds, hitbox, window, _| {
+                    move |bounds, _, _| bounds_cell.set(Some(bounds)),
+                    move |bounds, _, window, _| {
                         let geometry = Geometry::new(bounds);
                         geometry.paint_disc(window, geometry.outer_radius() + 6.0, to_hsla(0x18191c));
                         let Some(view) = paint_view else { return };
@@ -1563,98 +1454,39 @@ impl Petal {
                         let mut motion = motion.borrow_mut();
                         motion.retarget(view.id as usize, &view.keys, &view.segments, fraction);
                         motion.step(clock::now());
-                        let fraction = motion.fraction;
-                        for moving in motion.segments_mut() {
-                            let Some(i) = moving.current else {
-                                // Leaving the layout: keep its last colour while it shrinks away.
-                                let (r0, r1) = geometry.ring_at(moving.depth);
-                                geometry.paint_band(window, r0, r1, moving.start * fraction, moving.end * fraction, moving.color);
-                                continue;
-                            };
+                        let fraction = motion.fraction();
+                        motion.paint(window, &geometry, |i, start, end| {
                             // Hue follows the animated position, so colours shift smoothly too.
-                            let segment = &Segment { start: moving.start, end: moving.end, ..view.segments[i] };
-                            let color = match segment.target {
+                            let segment = &Segment { start, end, ..view.segments[i] };
+                            match segment.target {
                                 Target::Node(ix) if Some(ix) == view.pending => gpui::hsla(0.0, 0.0, pulse, 1.0),
                                 Target::Node(ix) => {
-                                    let base = sunburst::base_color(segment);
-                                    // Folders still being counted are drawn muted; they "settle" into
-                                    // full colour when their total is final.
-                                    let base = if view.tree.nodes[ix].kind == Kind::Dir && !view.is_final(ix) { sunburst::dim(base) } else { base };
-                                    // A brief glow as the folder's total becomes final.
-                                    let base = match view.settled_at.get(&ix) {
-                                        Some(at) => {
-                                            let k = 1.0 - (clock::since(*at).as_secs_f32() / SETTLE_GLOW.as_secs_f32()).min(1.0);
-                                            gpui::hsla(base.hue.into_positive_degrees() / 360.0, base.saturation, (base.lightness + 0.2 * k).min(0.92), 1.0)
-                                        }
-                                        None => base,
-                                    };
-                                    match hover_ix {
-                                        Some(h) if is_within(&view.tree, ix, h) => sunburst::highlight(base),
-                                        _ => base,
+                                    let full = sunburst::base_color(segment);
+                                    // Folders still being counted are drawn muted, and ease into full
+                                    // colour once their total is final.
+                                    if view.tree.nodes[ix].kind == Kind::Dir {
+                                        let settled = match view.settled_at.get(&ix) {
+                                            _ if !view.is_final(ix) => 0.0,
+                                            Some(at) => {
+                                                let t = (clock::since(*at).as_secs_f32() / SETTLE_FADE.as_secs_f32()).min(1.0);
+                                                t * t * (3.0 - 2.0 * t)
+                                            }
+                                            None => 1.0,
+                                        };
+                                        sunburst::mix(sunburst::dim(full), full, settled)
+                                    } else {
+                                        full
                                     }
                                 }
                                 Target::Small { .. } => sunburst::base_color(segment),
-                            };
-                            moving.color = color;
-                            let (r0, r1) = geometry.ring_at(moving.depth);
-                            geometry.paint_band(window, r0, r1, moving.start * fraction, moving.end * fraction, color);
-                        }
+                            }
+                        });
                         drop(motion);
                         if fraction < 0.9999 {
                             geometry.paint_sector(window, 1, fraction, 1.0, gpui::hsla(0.0, 0.0, pulse, 1.0));
                         }
                         window.request_animation_frame();
                         geometry.paint_disc(window, geometry.inner_radius - 1.0, to_hsla(0x2b2d33));
-
-                        // Hit testing against exactly what was painted, so a newer snapshot can't
-                        // shift what a click means.
-                        let target_at = {
-                            let view = view.clone();
-                            move |position| -> Option<(bool, Vec<SharedString>)> {
-                                match geometry.hit_test(position, &view.segments)? {
-                                    Hit::Center => Some((true, path_to(&view.tree, view.tree.nodes[view.focus].parent.unwrap_or(Tree::ROOT)))),
-                                    Hit::Segment(i) => match view.segments[i].target {
-                                        Target::Node(ix) => Some((false, path_to(&view.tree, ix))),
-                                        Target::Small { .. } => None,
-                                    },
-                                }
-                            }
-                        };
-                        let openable = {
-                            let view = view.clone();
-                            move |path: &[SharedString]| {
-                                let ix = resolve_path(&view.tree, path);
-                                view.tree.nodes[ix].kind == Kind::Dir && !view.tree.nodes[ix].children.is_empty()
-                            }
-                        };
-                        if let Some(position) = window.mouse_position().into() {
-                            if bounds.contains(&position) {
-                                if let Some((center, path)) = target_at(position) {
-                                    if center || openable(&path) {
-                                        window.set_cursor_style(CursorStyle::PointingHand, &hitbox);
-                                    }
-                                }
-                            }
-                        }
-                        let (move_target, move_entity) = (target_at.clone(), entity.clone());
-                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
-                            if phase != DispatchPhase::Bubble || !bounds.contains(&event.position) {
-                                return;
-                            }
-                            let path = move_target(event.position).filter(|(center, _)| !center).map(|(_, p)| p);
-                            move_entity.update(cx, |this, cx| this.live_hover(path, cx)).ok();
-                        });
-                        let click_entity = entity.clone();
-                        window.on_mouse_event(move |event: &MouseDownEvent, phase, _, cx: &mut App| {
-                            if phase != DispatchPhase::Bubble || event.button != MouseButton::Left || !bounds.contains(&event.position) {
-                                return;
-                            }
-                            if let Some((center, path)) = target_at(event.position) {
-                                if center || openable(&path) {
-                                    click_entity.update(cx, |this, cx| this.live_focus(path, cx)).ok();
-                                }
-                            }
-                        });
                     },
                 )
                 .size_full(),
@@ -2083,7 +1915,7 @@ impl Petal {
                 let lit = match (s.target, target) {
                     (a, b) if a == b => true,
                     (Target::Node(n), Target::Node(h)) => tree.is_ancestor_or_self(h, n),
-                    (Target::Small { parent }, Target::Node(h)) => tree.is_ancestor_or_self(h, parent),
+                    (Target::Small { parent, .. }, Target::Node(h)) => tree.is_ancestor_or_self(h, parent),
                     _ => false,
                 };
                 match (lit, r.color_by) {
@@ -2118,7 +1950,7 @@ impl Petal {
                 };
                 (node.name.clone(), format!("{}\n{detail}{kind}", format_size(node.size)))
             }
-            Some(Target::Small { parent }) => {
+            Some(Target::Small { parent, .. }) => {
                 let seg_size: u64 = tree.nodes[parent]
                     .children
                     .iter()
@@ -2140,8 +1972,10 @@ impl Petal {
             .unwrap_or(140.);
 
         let segments = r.segments.clone();
+        let (keys, layout_id, motion) = (r.keys.clone(), r.layout_id, r.motion.clone());
+        // Colouring by folder takes the hue from the angle, so it follows the motion.
+        let hue_follows = r.color_by == ColorBy::Folder;
         let bounds_cell = r.chart_bounds.clone();
-        let anim_start = r.anim_start;
         let entity = cx.entity().downgrade();
 
         div()
@@ -2156,21 +1990,24 @@ impl Petal {
                     },
                     move |bounds, hitbox, window, _| {
                         let geometry = Geometry::new(bounds);
-                        let t = (clock::since(anim_start).as_secs_f32() / ZOOM_DURATION.as_secs_f32()).min(1.0);
-                        let eased = 1.0 - (1.0 - t).powi(3);
-                        if t < 1.0 {
+                        geometry.paint_disc(window, geometry.outer_radius() + 6.0, to_hsla(0x18191c));
+                        let mut motion = motion.borrow_mut();
+                        motion.retarget(layout_id as usize, &keys, &segments, 1.0);
+                        if motion.step(clock::now()) {
                             window.request_animation_frame();
                         }
-
-                        geometry.paint_disc(window, geometry.outer_radius() + 6.0, to_hsla(0x18191c));
-                        for (segment, color) in segments.iter().zip(&colors) {
-                            if segment.depth as f32 > 1.0 + eased * sunburst::MAX_DEPTH as f32 {
-                                continue;
-                            }
-                            geometry.paint_sector(window, segment.depth, segment.start * eased, segment.end * eased, *color);
-                        }
+                        motion.paint(window, &geometry, |i, start, end| {
+                            let color = colors[i];
+                            if hue_follows { gpui::hsla(((start + end) / 2.0).rem_euclid(1.0), color.saturation, color.lightness, color.alpha) } else { color }
+                        });
+                        let folding = motion.folding();
+                        drop(motion);
                         let center = if center_hovered { to_hsla(0x3a3d44) } else { to_hsla(0x2b2d33) };
                         geometry.paint_disc(window, geometry.inner_radius - 1.0, center);
+                        // Mid-fold, nothing is where it's drawn: leave the pointer be until it's done.
+                        if folding {
+                            return;
+                        }
 
                         if pointer {
                             window.set_cursor_style(CursorStyle::PointingHand, &hitbox);

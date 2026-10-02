@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::disk::{self, DiskLayout};
@@ -26,7 +26,15 @@ pub struct LiveNode {
     pub children: Mutex<LiveChildren>,
     /// Set once everything below this folder has been counted: its size is final.
     pub done: AtomicBool,
+    /// When a snapshot first had something here, as a sequence number: snapshots list
+    /// folders in this order (see `snapshot`).
+    seen: OnceLock<u64>,
+    /// When a snapshot first found this folder final.
+    settled: OnceLock<Instant>,
 }
+
+/// Hands out `LiveNode::seen`.
+static NEXT_SEEN: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
 pub struct LiveChildren {
@@ -62,10 +70,18 @@ impl LiveNode {
 /// A `Tree` of directory totals as they stand right now. For the startup disk, the
 /// other volumes and the not-yet-scanned remainder are added so the chart always shows
 /// the whole disk.
+///
+/// Folders are listed in the order they first had something in them, not by size: while
+/// they're being counted, folders constantly overtake each other, and re-sorting would
+/// send them sliding across one another in the chart at every snapshot. This way the
+/// chart grows in place; the results are sorted by size. Folders appearing together go
+/// largest first.
 pub fn snapshot(live: &LiveNode, root_path: &Path, layout: Option<&DiskLayout>) -> LiveSnapshot {
     let mut nodes = Vec::new();
     let mut done = Vec::new();
-    add(live, scan::display_name(root_path), None, &mut nodes, &mut done);
+    let mut settled = Vec::new();
+    let now = crate::clock::now();
+    add(live, scan::display_name(root_path), None, now, &mut nodes, &mut done, &mut settled);
     if let Some(layout) = layout {
         let scanned = nodes[Tree::ROOT].size;
         let remaining = layout.data_used.saturating_sub(scanned);
@@ -74,25 +90,38 @@ pub fn snapshot(live: &LiveNode, root_path: &Path, layout: Option<&DiskLayout>) 
             let ix = nodes.len();
             // The volume slices are exact from the start; the remainder obviously isn't.
             done.push(name != disk::NOT_SCANNED);
+            settled.push(None);
             nodes.push(Node { name: name.into(), size, kind: Kind::Other, parent: Some(Tree::ROOT), children: Vec::new(), items: 0 });
             nodes[Tree::ROOT].children.push(ix);
             nodes[Tree::ROOT].size += size;
         }
+        // Added after the folders, with the remainder last, so the order holds still too.
         nodes[Tree::ROOT].name = layout.name.clone().into();
-        scan::sort_children(&mut nodes, Tree::ROOT);
     }
-    LiveSnapshot { tree: Tree { root_path: root_path.to_path_buf(), nodes, errors: 0, cloud_only: 0 }, done }
+    LiveSnapshot { tree: Tree { root_path: root_path.to_path_buf(), nodes, errors: 0, cloud_only: 0 }, done, settled }
 }
 
-/// The live totals as a tree, plus which folders are final (indexed like `tree.nodes`).
+/// The live totals as a tree, plus which folders are final and since when (indexed like
+/// `tree.nodes`).
 pub struct LiveSnapshot {
     pub tree: Tree,
     pub done: Vec<bool>,
+    pub settled: Vec<Option<Instant>>,
 }
 
-fn add(live: &LiveNode, name: String, parent: Option<usize>, nodes: &mut Vec<Node>, done: &mut Vec<bool>) -> usize {
+fn add(
+    live: &LiveNode,
+    name: String,
+    parent: Option<usize>,
+    now: Instant,
+    nodes: &mut Vec<Node>,
+    done: &mut Vec<bool>,
+    settled: &mut Vec<Option<Instant>>,
+) -> usize {
     let ix = nodes.len();
-    done.push(live.done.load(Ordering::Acquire));
+    let is_done = live.done.load(Ordering::Acquire);
+    done.push(is_done);
+    settled.push(is_done.then(|| *live.settled.get_or_init(|| now)));
     nodes.push(Node {
         name: name.into(),
         size: 0,
@@ -105,13 +134,21 @@ fn add(live: &LiveNode, name: String, parent: Option<usize>, nodes: &mut Vec<Nod
     let mut size = live.bytes.load(Ordering::Relaxed);
     let mut items = live.files.load(Ordering::Relaxed);
     let mut children = Vec::with_capacity(kids.len());
-    for kid in kids {
-        let child = add(&kid, kid.name.clone(), Some(ix), nodes, done);
+    for kid in &kids {
+        let child = add(kid, kid.name.clone(), Some(ix), now, nodes, done, settled);
         size += nodes[child].size;
         items += nodes[child].items;
-        children.push(child);
+        children.push((child, kid));
     }
-    children.sort_by_key(|&c| std::cmp::Reverse(nodes[c].size));
+    children.sort_by_key(|&(c, _)| std::cmp::Reverse(nodes[c].size));
+    for (c, kid) in &children {
+        if nodes[*c].size > 0 {
+            kid.seen.get_or_init(|| NEXT_SEEN.fetch_add(1, Ordering::Relaxed));
+        }
+    }
+    // Stable, so folders with nothing in them yet stay in size order, at the end.
+    children.sort_by_key(|(_, kid)| kid.seen.get().copied().unwrap_or(u64::MAX));
+    let children: Vec<usize> = children.into_iter().map(|(c, _)| c).collect();
     let node = &mut nodes[ix];
     node.size = size;
     node.items = items;
@@ -274,8 +311,11 @@ pub fn bench(root: &Path, runs: usize) {
         };
         let (f50, f90) = (finalized(0.5), finalized(0.9));
         // Ranking: from when the three biggest top-level folders are in their final order for good.
+        // (Snapshots list folders in the order they appeared, so sort by size here.)
         let top3 = |tree: &Tree| -> Vec<String> {
-            folders(tree).take(3).map(|c| tree.nodes[c].name.to_string()).collect()
+            let mut biggest: Vec<usize> = folders(tree).collect();
+            biggest.sort_by_key(|&c| std::cmp::Reverse(tree.nodes[c].size));
+            biggest.into_iter().take(3).map(|c| tree.nodes[c].name.to_string()).collect()
         };
         let final_top3 = top3(final_snap);
         let mut rank = total.as_secs_f64();

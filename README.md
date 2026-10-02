@@ -32,8 +32,8 @@ will free.
 ## Highlights
 
 - **Live from the first second.** The chart appears straight away and fills in as Petal reads. Folders
-  turn from muted to full colour the moment their total is final, and you can click into them before
-  the scan has finished. Segments glide into place instead of jumping.
+  turn from muted to full colour the moment their total is final. The chart grows in place as one
+  piece, folds over into size order when the scan finishes, and zooms like a camera.
 - **Fast.** A whole Mac (about 6 million files) in roughly 25 seconds; a typical home folder in a few
   seconds; a 90,000-item folder in under a second. Directory listings use `getattrlistbulk` and
   `openat` across all cores. The [performance notes](docs/PERFORMANCE.md) have the measurements.

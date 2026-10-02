@@ -17,8 +17,9 @@ const GAP_PX: f32 = 1.2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
     Node(usize),
-    /// Aggregated tiny children of `parent`.
-    Small { parent: usize },
+    /// Aggregated tiny children of `parent`, a run of them starting at `first`. (A folder
+    /// can have several runs when its children aren't sorted by size, as mid-scan.)
+    Small { parent: usize, first: usize },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -33,7 +34,7 @@ pub struct Segment {
 
 impl Segment {
     pub fn hue(&self) -> f32 {
-        (self.start + self.end) / 2.0
+        ((self.start + self.end) / 2.0).rem_euclid(1.0)
     }
 }
 
@@ -54,11 +55,11 @@ fn layout_children(tree: &Tree, ix: usize, depth: usize, start: f32, end: f32, o
     // Thin children are merged into one "smaller objects" sliver. Children are sorted
     // largest first, except slices pinned to the end (e.g. "Not scanned yet"), so keep
     // going after the thin ones: anything large after them still gets its own segment.
-    let mut small: Option<(f32, f32)> = None;
-    let flush = |small: &mut Option<(f32, f32)>, out: &mut Vec<Segment>| {
-        if let Some((from, width)) = small.take() {
+    let mut small: Option<(f32, f32, usize)> = None;
+    let flush = |small: &mut Option<(f32, f32, usize)>, out: &mut Vec<Segment>| {
+        if let Some((from, width, first)) = small.take() {
             if width >= MIN_TURNS / 2.0 {
-                out.push(Segment { target: Target::Small { parent: ix }, depth, start: from, end: from + width, kind: Kind::File });
+                out.push(Segment { target: Target::Small { parent: ix, first }, depth, start: from, end: from + width, kind: Kind::File });
             }
         }
     };
@@ -66,7 +67,7 @@ fn layout_children(tree: &Tree, ix: usize, depth: usize, start: f32, end: f32, o
         let child = &tree.nodes[child_ix];
         let width = (span as f64 * child.size as f64 / total) as f32;
         if width < MIN_TURNS {
-            let run = small.get_or_insert((angle, 0.0));
+            let run = small.get_or_insert((angle, 0.0, child_ix));
             run.1 += width;
             angle += width;
             continue;
@@ -87,6 +88,28 @@ fn layout_children(tree: &Tree, ix: usize, depth: usize, start: f32, end: f32, o
     flush(&mut small, out);
 }
 
+/// Where `node` sits in the chart centred on `ancestor`: its angles, and its ring
+/// (0 for `ancestor` itself, which is the centre). Matches `layout`, ignoring merging.
+pub fn frame_of(tree: &Tree, ancestor: usize, node: usize) -> Option<(f32, f32, f32)> {
+    let mut chain = vec![node];
+    while *chain.last()? != ancestor {
+        chain.push(tree.nodes[*chain.last()?].parent?);
+    }
+    let (mut start, mut end) = (0.0f64, 1.0f64);
+    for pair in chain.windows(2).rev() {
+        let (child, parent) = (pair[0], pair[1]);
+        let total = tree.nodes[parent].size as f64;
+        if total <= 0.0 {
+            return None;
+        }
+        let span = end - start;
+        let before: u64 = tree.nodes[parent].children.iter().take_while(|&&c| c != child).map(|&c| tree.nodes[c].size).sum();
+        start += span * before as f64 / total;
+        end = start + span * tree.nodes[child].size as f64 / total;
+    }
+    Some((start as f32, end as f32, (chain.len() - 1) as f32))
+}
+
 pub fn base_color(segment: &Segment) -> Hsla {
     let d = (segment.depth - 1) as f32;
     match (segment.target, segment.kind) {
@@ -95,6 +118,17 @@ pub fn base_color(segment: &Segment) -> Hsla {
         (_, Kind::Other) => hsla(0.0, 0.0, 0.45, 1.0),
         (_, Kind::Dir) => hsla(segment.hue(), 0.70 - d * 0.06, 0.52 + d * 0.035, 1.0),
     }
+}
+
+/// Blend from `from` to `to` (saturation and lightness; the hue is `to`'s).
+pub fn mix(from: Hsla, to: Hsla, t: f32) -> Hsla {
+    let t = t.clamp(0.0, 1.0);
+    hsla(
+        hue_turns(&to),
+        from.saturation + (to.saturation - from.saturation) * t,
+        from.lightness + (to.lightness - from.lightness) * t,
+        to.alpha,
+    )
 }
 
 fn hue_turns(color: &Hsla) -> f32 {
@@ -190,13 +224,32 @@ impl Geometry {
 
     /// Inner and outer radius at a fractional ring depth (1.0 = first ring), so a
     /// segment can glide between rings.
-    pub fn ring_at(&self, depth: f32) -> (f32, f32) {
+    fn ring_at(&self, depth: f32) -> (f32, f32) {
         let depth = depth.clamp(1.0, MAX_DEPTH as f32);
         let below = depth.floor() as usize;
         let above = (below + 1).min(MAX_DEPTH);
         let t = depth - below as f32;
         let (a, b) = (self.rings[below - 1], self.rings[above - 1]);
         (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t)
+    }
+
+    /// Inner and outer radius, and opacity, at any fractional ring depth. Below the first
+    /// ring a band sinks behind the centre, fading; beyond the last it moves out past the
+    /// edge, fading. That's where the camera takes segments when zooming.
+    pub fn band_at(&self, depth: f32) -> (f32, f32, f32) {
+        let last = MAX_DEPTH as f32;
+        if depth < 1.0 {
+            let (r0, r1) = self.rings[0];
+            let shift = (1.0 - depth) * (r1 - r0);
+            ((r0 - shift).max(0.0), (r1 - shift).max(0.0), depth.clamp(0.0, 1.0))
+        } else if depth > last {
+            let (r0, r1) = self.rings[MAX_DEPTH - 1];
+            let shift = (depth - last) * (r1 - r0);
+            (r0 + shift, r1 + shift, (last + 1.0 - depth).clamp(0.0, 1.0))
+        } else {
+            let (r0, r1) = self.ring_at(depth);
+            (r0, r1, 1.0)
+        }
     }
 
     /// Paint an annular sector between two radii, leaving a hairline gap around it.
@@ -277,5 +330,8 @@ mod tests {
         assert!(targets.contains(&Target::Node(5)), "the large last slice has its own segment: {targets:?}");
         let last = segments.iter().find(|s| s.target == Target::Node(5)).unwrap();
         assert!((last.end - 1.0).abs() < 1e-4 && last.end - last.start > 0.39);
+
+        let (start, end, ring) = frame_of(&tree, Tree::ROOT, 5).unwrap();
+        assert!((start - last.start).abs() < 1e-4 && (end - last.end).abs() < 1e-4 && ring == 1.0);
     }
 }
