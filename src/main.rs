@@ -12,6 +12,7 @@ mod scan;
 #[cfg(feature = "snapshot")]
 mod snapshot;
 mod sunburst;
+mod trashing;
 mod watch;
 
 use std::path::PathBuf;

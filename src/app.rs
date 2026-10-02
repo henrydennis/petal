@@ -26,6 +26,7 @@ use crate::live;
 use crate::motion;
 use crate::scan::{self, Kind, Progress, Tree, Volume, format_count, format_size};
 use crate::sunburst::{self, Geometry, Hit, Segment, Target};
+use crate::trashing;
 use crate::watch;
 
 actions!(petal, [GoUp, OpenFolder, Rescan, StartOver]);
@@ -980,7 +981,7 @@ impl Petal {
                 return;
             }
             let result = cx
-                .background_spawn(async move { trash::delete_all(&paths) })
+                .background_spawn(async move { trashing::move_to_trash(&paths) })
                 .await;
             this.update(cx, |this, cx| {
                 match result {
