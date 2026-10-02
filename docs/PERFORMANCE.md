@@ -52,16 +52,27 @@ What made the biggest difference:
    caches, Movies, Mail…) before the main walk, which reuses those results rather than re-reading them.
    Hotspots are exact within ~2.5 s on a full disk.
 3. **Final as you go.** A folder is marked final the moment the walk leaves it, and drawn in full
-   colour; folders still counting are muted and labelled "≥ size". You can click into the chart
-   mid-scan. On a full disk, half the bytes sit in final folders by ~11 s of a ~24 s scan.
+   colour; folders still counting are muted and labelled "≥ size". The chart is look-only until
+   the scan finishes (nothing under the pointer changes as it grows). On a full disk, half the bytes sit in final folders by ~11 s of a ~24 s scan.
 4. **An exact skeleton for the startup disk.** Scanning `/` reads only the Data volume; every other
    APFS volume in the container (macOS itself, Preboot, VM, Recovery, Update) gets an exact slice
    from `ATTR_VOL_SPACEUSED`, and whatever couldn't be read becomes an exact "Not readable" slice.
    The chart's total therefore equals the disk's used space to the byte.
-5. **Motion.** Every segment eases towards its latest target (exponential approach, τ = 0.12 s),
-   matched across snapshots by folder path, so the chart glides instead of jumping ten times a second.
-   Measured on real frames at 120 Hz: the old chart's edge stood still in 93% of frames and then
-   jumped up to 10.7°; now it moves every frame, at most 1.0°.
+5. **Motion.** Segments are matched across snapshots by folder path, and every edge follows the
+   same critically damped spring (ω = 13/s, settling in about half a second), so the chart glides
+   instead of jumping ten times a second. Measured on real frames at 120 Hz: the old chart's edge
+   stood still in 93% of frames and then jumped up to 10.7°; now it moves every frame, at most 1.0°.
+   The chart moves as one piece: new folders open up at the edge they share with a sibling,
+   departed ones close up where their neighbours meet, and mid-scan folders keep the place they
+   first appeared in rather than being re-sorted by size at each snapshot (the order lives on the
+   live tree's nodes, so building a snapshot's view stays well under a millisecond), so no two
+   segments ever slide across each other and no gaps open. When the results do re-sort (sizes
+   changing on disk), a folder that changes place closes up where it was and opens where it goes.
+   Changing folder moves a camera over the whole chart, and the first chart is revealed outward
+   from the centre. When the scan finishes, its chart is re-sorted by size, which moves almost
+   everything; rather than shuffle, the scan's chart folds away clockwise, smallest folder
+   first, while the results open clockwise from the top into the room it leaves, at their true
+   sizes, largest first (about a second).
 
 Rejected: a breadth-first work queue (every live metric got worse: it explores structure before the
 leaves where the bytes are) and dropping the barrier between hotspots and the main walk (the
