@@ -311,8 +311,11 @@ pub fn bench(root: &Path, runs: usize) {
         };
         let (f50, f90) = (finalized(0.5), finalized(0.9));
         // Ranking: from when the three biggest top-level folders are in their final order for good.
+        // (Snapshots list folders in the order they appeared, so sort by size here.)
         let top3 = |tree: &Tree| -> Vec<String> {
-            folders(tree).take(3).map(|c| tree.nodes[c].name.to_string()).collect()
+            let mut biggest: Vec<usize> = folders(tree).collect();
+            biggest.sort_by_key(|&c| std::cmp::Reverse(tree.nodes[c].size));
+            biggest.into_iter().take(3).map(|c| tree.nodes[c].name.to_string()).collect()
         };
         let final_top3 = top3(final_snap);
         let mut rank = total.as_secs_f64();

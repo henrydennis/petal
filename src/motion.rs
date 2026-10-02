@@ -183,6 +183,8 @@ struct Fold {
     /// How long it takes (it depends on the sizes).
     length: f32,
     new_groups: Vec<Group>,
+    /// The next layout has arrived (it may be empty: an empty folder).
+    opened: bool,
     /// Which of `new_groups` each segment of the results belongs to.
     new_group_of: HashMap<Key, usize>,
 }
@@ -323,7 +325,7 @@ impl ChartMotion {
         // Smallest first; of equal ones, the one nearer the top first (clockwise).
         schedule(&mut groups, FOLD_STAGGER, |a, b| a.width.total_cmp(&b.width).then(a.start.total_cmp(&b.start)));
         let length = groups.iter().map(|g| g.from).fold(0.0, f32::max) + FOLD_EACH;
-        self.fold = Some(Fold { t: 0.0, old, old_groups: groups, length, new_groups: Vec::new(), new_group_of: HashMap::new() });
+        self.fold = Some(Fold { t: 0.0, old, old_groups: groups, length, new_groups: Vec::new(), opened: false, new_group_of: HashMap::new() });
         self.segments.clear();
         self.camera = None;
         self.layout_id = 0;
@@ -362,6 +364,7 @@ impl ChartMotion {
             // The opening goes by the new layout's top-level segments.
             fold.new_groups.clear();
             fold.new_group_of.clear();
+            fold.opened = true;
             for (key, segment) in keys.iter().zip(segments) {
                 if segment.depth == 1 {
                     fold.new_groups.push(Group { start: segment.start, width: segment.end - segment.start, from: 0.0 });
@@ -577,7 +580,7 @@ impl ChartMotion {
         if let Some(fold) = &mut self.fold {
             fold.t += dt;
             moving = true;
-            if fold.t >= fold.length && !fold.new_groups.is_empty() {
+            if fold.t >= fold.length && fold.opened {
                 self.fold = None;
             }
         }
@@ -844,6 +847,25 @@ mod tests {
         assert_eq!(shown, [key("d"), key("b"), key("c"), key("a")]);
         assert!(!motion.folding() && close(new_arc, 1.0));
         assert!(frames < 90, "done within ~1.5 s, took {frames} frames");
+    }
+
+    #[test]
+    fn folding_into_an_empty_chart_still_ends() {
+        let mut motion = ChartMotion::default();
+        let mut t = Instant::now();
+        motion.retarget(1, &[key("a")], &[seg(0.0, 1.0, 1)], 1.0);
+        run(&mut motion, &mut t, |_| {});
+        motion.fold();
+        let mut frames = 0;
+        loop {
+            motion.retarget(2, &[], &[], 1.0);
+            if !motion.step(t) || frames > 600 {
+                break;
+            }
+            t += Duration::from_millis(16);
+            frames += 1;
+        }
+        assert!(!motion.folding() && frames < 90, "the fold ends, after {frames} frames");
     }
 
     #[test]
