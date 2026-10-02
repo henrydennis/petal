@@ -107,6 +107,41 @@ pub fn early_findings(early: &[Early]) -> Vec<Finding> {
     findings
 }
 
+/// Folder extensions that make a macOS bundle: an app, or a part of one. What's inside
+/// belongs to that app (Electron apps ship their own `node_modules`), so no finding may
+/// include it, whatever its name.
+const BUNDLE_EXTENSIONS: &[&str] = &[
+    "app", "appex", "framework", "bundle", "plugin", "xpc", "kext", "systemextension", "dext", "qlgenerator",
+    "mdimporter", "prefpane", "saver", "component", "vst", "vst3", "aaxplugin", "driver", "xcarchive",
+    "photoslibrary", "musiclibrary", "fcpbundle", "pkg", "mpkg",
+];
+
+fn is_bundle(name: &str) -> bool {
+    name.rsplit_once('.')
+        .is_some_and(|(stem, ext)| !stem.is_empty() && BUNDLE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
+/// Whether `ix`, or any folder above it in the tree, is a bundle.
+fn inside_bundle(tree: &Tree, mut ix: usize) -> bool {
+    loop {
+        if is_bundle(tree.nodes[ix].name.as_ref()) {
+            return true;
+        }
+        match tree.nodes[ix].parent {
+            Some(parent) => ix = parent,
+            None => return tree.root_path.components().any(|c| is_bundle(&c.as_os_str().to_string_lossy())),
+        }
+    }
+}
+
+/// Folders whose `node_modules` belong to something other than a project you can
+/// reinstall: hidden folders (editor extensions in ~/.vscode, Node versions in ~/.nvm,
+/// global installs), `Library` (app-managed data such as extensions in Application
+/// Support) and `Applications`, besides bundles.
+fn not_a_project_area(name: &str) -> bool {
+    name.starts_with('.') || name == "Library" || name == "Applications" || is_bundle(name)
+}
+
 /// Findings from a finished scan: the catalog locations, plus every `node_modules`.
 /// Sizes start as allocated size, all `pending`: what deleting really frees depends on
 /// APFS clone sharing, which the caller works out in the background (`scan::frees_of`).
@@ -120,6 +155,9 @@ fn from_tree_min(tree: &Tree, bases: &Bases, min_size: u64) -> Vec<Finding> {
         for category in CATALOG {
             let Some(path) = bases.locate(category) else { continue };
             let Some(ix) = tree.find(&path) else { continue };
+            if inside_bundle(tree, ix) {
+                continue;
+            }
             let size = tree.nodes[ix].size;
             if size >= min_size {
                 findings.push(Finding {
@@ -136,26 +174,33 @@ fn from_tree_min(tree: &Tree, bases: &Bases, min_size: u64) -> Vec<Finding> {
         }
     }
 
-    // node_modules anywhere, counting nested ones once.
+    // A project's node_modules, counting nested ones once: next to a package.json (so a
+    // package manager can put it back), and not inside an app, an editor's extensions, a
+    // global install or app-managed data, where deleting it breaks that software.
     let mut modules = Vec::new();
-    let mut stack = vec![Tree::ROOT];
-    while let Some(ix) = stack.pop() {
+    let root_excluded = tree.root_path.components().any(|c| not_a_project_area(&c.as_os_str().to_string_lossy()));
+    let mut stack = vec![(Tree::ROOT, root_excluded)];
+    while let Some((ix, excluded)) = stack.pop() {
+        let has_package_json =
+            tree.nodes[ix].children.iter().any(|&c| tree.nodes[c].kind == Kind::File && tree.nodes[c].name.as_ref() == "package.json");
         for &child in &tree.nodes[ix].children {
             let node = &tree.nodes[child];
             if node.kind != Kind::Dir {
                 continue;
             }
             if node.name.as_ref() == "node_modules" {
-                modules.push(child);
+                if !excluded && has_package_json {
+                    modules.push(child);
+                }
             } else {
-                stack.push(child);
+                stack.push((child, excluded || not_a_project_area(node.name.as_ref())));
             }
         }
     }
     // Clone sharing isn't known here (pnpm installs them as clones), so start from the
     // allocated size and let the caller work out what deleting really frees.
     let size: u64 = modules.iter().map(|&ix| tree.nodes[ix].size).sum();
-    if size >= min_size {
+    if !modules.is_empty() && size >= min_size {
         findings.push(Finding {
             title: "node_modules",
             blurb: format!("In {} projects; reinstall with your package manager", modules.len()),
@@ -233,9 +278,11 @@ mod tests {
         let home = dir.join("home");
         write(&home.join(".Trash/old.dmg"), 300_000);
         write(&home.join("Downloads/setup.pkg"), 200_000);
+        write(&home.join("code/app/package.json"), 100);
         write(&home.join("code/app/node_modules/a/index.js"), 100_000);
         // Nested node_modules must not be counted twice.
         write(&home.join("code/app/node_modules/b/node_modules/c/index.js"), 50_000);
+        write(&home.join("code/lib/package.json"), 100);
         write(&home.join("code/lib/node_modules/d/index.js"), 70_000);
 
         let tree = scan(&dir, &Progress::default());
@@ -255,6 +302,64 @@ mod tests {
         assert_eq!(modules.size, expected);
         // Largest first.
         assert!(findings.windows(2).all(|w| w[0].size >= w[1].size));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Only a project's node_modules is safe to delete. Apps (installed or built locally)
+    /// ship their own, as do editor extensions, global installs and app-managed data;
+    /// deleting those breaks the software, as one user found with Cursor and T3 Code.
+    #[test]
+    fn node_modules_only_in_projects() {
+        let dir = std::env::temp_dir().join(format!("petal-modules-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        let project = |path: &str| {
+            write(&home.join(path).join("package.json"), 100);
+            write(&home.join(path).join("node_modules/x/index.js"), 10_000);
+        };
+        project("code/site");
+        project("code/monorepo/packages/web");
+        // Not projects you can reinstall:
+        project("Applications/Cursor.app/Contents/Resources/app");
+        project("code/t3code/release/mac-arm64/T3 Code.app/Contents/Resources/app");
+        project("code/t3code/release/mac-arm64/T3 Code.app/Contents/Resources/app.asar.unpacked");
+        project("code/tool/Helper.framework/Resources");
+        project(".vscode/extensions/someone.ext-1.2.3");
+        project(".cursor/extensions/someone.ext-1.2.3");
+        project("Library/Application Support/Claude/Claude Extensions/server");
+        project(".config/raycast/extensions/abc");
+        write(&home.join(".nvm/versions/node/v22.0.0/lib/node_modules/npm/index.js"), 10_000);
+        write(&home.join("code/no-package-json/node_modules/x/index.js"), 10_000);
+
+        let tree = scan(&dir, &Progress::default());
+        let findings = from_tree_min(&tree, &Bases { home: Some(home.clone()), user_temp: None }, 0);
+        let modules = findings.iter().find(|f| f.title == "node_modules").expect("node_modules");
+        let mut found: Vec<PathBuf> = modules.nodes.iter().map(|&ix| tree.path_of(ix)).collect();
+        found.sort();
+        assert_eq!(found, [home.join("code/monorepo/packages/web/node_modules"), home.join("code/site/node_modules")]);
+        assert_eq!(modules.blurb, "In 2 projects; reinstall with your package manager");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// No finding may include anything inside an app or other bundle: not node_modules,
+    /// and not any catalog location, now or added later.
+    #[test]
+    fn nothing_inside_bundles() {
+        for category in CATALOG {
+            assert!(!category.path.split('/').any(is_bundle), "{} runs through a bundle", category.path);
+        }
+        assert!(is_bundle("Cursor.app") && is_bundle("T3 Code.app") && is_bundle("Electron Framework.framework"));
+        assert!(!is_bundle("node_modules") && !is_bundle(".app") && !is_bundle("app") && !is_bundle("my.config"));
+
+        // A scan whose root is inside an app finds nothing to delete there either.
+        let dir = std::env::temp_dir().join(format!("petal-bundle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let app = dir.join("Some.app/Contents/Resources/app");
+        write(&app.join("package.json"), 100);
+        write(&app.join("node_modules/x/index.js"), 10_000);
+        let tree = scan(&app, &Progress::default());
+        let findings = from_tree_min(&tree, &Bases::default(), 0);
+        assert!(findings.iter().all(|f| f.title != "node_modules"), "{findings:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
