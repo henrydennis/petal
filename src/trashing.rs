@@ -19,13 +19,27 @@ pub fn move_to_trash(paths: &[PathBuf]) -> Result<(), String> {
         Err(error) => error,
     };
     // Finder may have moved some of them before it failed.
-    let left: Vec<&PathBuf> = paths.iter().filter(|p| p.symlink_metadata().is_ok()).collect();
+    let left = still_there(paths).map_err(|error| format!("{error} (Finder: {finder_error})"))?;
     if left.is_empty() {
         return Ok(());
     }
     let mut context = TrashContext::default();
     context.set_delete_method(DeleteMethod::NsFileManager);
     context.delete_all(left).map_err(|error| format!("{error} (Finder: {finder_error})"))
+}
+
+/// The paths that still exist. Only "not found" means gone: a path that can't be checked
+/// (no permission, say) may well still be there, so that's an error.
+fn still_there(paths: &[PathBuf]) -> Result<Vec<&PathBuf>, String> {
+    let mut left = Vec::new();
+    for path in paths {
+        match path.symlink_metadata() {
+            Ok(_) => left.push(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        }
+    }
+    Ok(left)
 }
 
 fn via_finder(paths: &[PathBuf]) -> Result<(), String> {
@@ -58,6 +72,24 @@ fn applescript_escape(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreadable_paths_are_not_taken_for_gone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("petal-still-there-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("locked")).unwrap();
+        std::fs::write(dir.join("here"), b"x").unwrap();
+        std::fs::write(dir.join("locked/inside"), b"x").unwrap();
+        let (here, gone, inside) = (dir.join("here"), dir.join("gone"), dir.join("locked/inside"));
+
+        assert_eq!(still_there(&[here.clone(), gone.clone()]).unwrap(), vec![&here]);
+        std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = still_there(&[here, gone, inside]).is_err();
+        std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result, "a path behind a locked folder may still exist");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn script_quotes_paths() {

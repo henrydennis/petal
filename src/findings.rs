@@ -193,10 +193,7 @@ fn from_tree_min(tree: &Tree, bases: &Bases, min_size: u64) -> Vec<Finding> {
     // and CLIs under ~/Library and dot-folders); deleting those breaks them, and no
     // package manager puts them back, so the walk stays out of all of those, and out of
     // where apps and the system live.
-    let home_library = bases.home.as_ref().map(|home| home.join("Library"));
-    let off_limits = |path: &Path| {
-        bases.protected.iter().any(|p| path.starts_with(p)) || home_library.as_deref() == Some(path)
-    };
+    let off_limits = |path: &Path| bases.protected.iter().any(|p| path.starts_with(p));
     let mut modules = Vec::new();
     let mut repos = Vec::new();
     let root_excluded = tree.root_path.components().any(|c| not_a_project_area(&c.as_os_str().to_string_lossy()))
@@ -335,12 +332,16 @@ pub fn git_gc_commands(git_dirs: &[PathBuf]) -> String {
 pub struct Bases {
     pub home: Option<PathBuf>,
     pub user_temp: Option<PathBuf>,
-    /// Where apps and the system live; nothing under them is ever a finding.
+    /// Where apps, the system and tools live; nothing under them is ever a finding.
     pub protected: Vec<PathBuf>,
 }
 
 /// Apps and the system: never searched for node_modules or anything else to delete.
+/// (So are ~/Applications and ~/Library, where apps and tools keep their files.)
 const PROTECTED: &[&str] = &["/Applications", "/System", "/Library"];
+
+/// The startup disk's Data volume, which `/` shows (through firmlinks) when scanning it.
+const DATA_VOLUME: &str = "/System/Volumes/Data";
 
 impl Bases {
     /// The real locations, as they appear under `tree_root`: as-is, or under the Data
@@ -357,8 +358,8 @@ impl Bases {
         let protected = PROTECTED
             .iter()
             .map(PathBuf::from)
-            .chain(home.as_ref().map(|home| home.join("Applications")))
-            .filter_map(within)
+            .chain(home.iter().flat_map(|home| [home.join("Applications"), home.join("Library")]))
+            .filter_map(|path| protected_in_tree(tree_root, path, within))
             .collect();
         Bases { home: home.and_then(within), user_temp: user_temp_dir().and_then(within), protected }
     }
@@ -370,6 +371,17 @@ impl Bases {
         }?;
         Some(base.join(category.path))
     }
+}
+
+/// A protected location as it appears in the tree at `tree_root`: the whole tree when the
+/// scan is inside it (e.g. a scan of ~/Library/Application Support), else wherever `within`
+/// finds it. The startup disk's Data volume counts as `/`, not as part of /System.
+fn protected_in_tree(tree_root: &Path, path: PathBuf, within: impl Fn(PathBuf) -> Option<PathBuf>) -> Option<PathBuf> {
+    let as_shown = match tree_root.strip_prefix(DATA_VOLUME) {
+        Ok(rest) => Path::new("/").join(rest),
+        Err(_) => tree_root.to_path_buf(),
+    };
+    if as_shown.starts_with(&path) { Some(tree_root.to_path_buf()) } else { within(path) }
 }
 
 /// e.g. /private/var/folders/xy/abc123…0000gn: the parent of DARWIN_USER_DIR.
@@ -429,7 +441,7 @@ mod tests {
         write(&dir.join("Library/Tool/node_modules/i/index.js"), 90_000);
 
         let tree = scan(&dir, &Progress::default());
-        let findings = from_tree_min(&tree, &Bases { home: Some(home.clone()), user_temp: None, protected: vec![dir.join("Library")] }, 0);
+        let findings = from_tree_min(&tree, &Bases { home: Some(home.clone()), user_temp: None, protected: vec![dir.join("Library"), home.join("Library")] }, 0);
         let by_title = |title: &str| findings.iter().find(|f| f.title == title);
 
         let trash = by_title("Trash").expect("trash");
@@ -543,6 +555,24 @@ mod tests {
         assert!(!is_inside_bundle(&tree, ix("code/Chat.app.md")));
         assert!(is_bundle("Sparkle.framework") && is_bundle("Helper.XPC") && !is_bundle("node_modules"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn protects_scans_inside_protected_folders() {
+        let none = |_: PathBuf| None;
+        let library = PathBuf::from("/Users/a/Library");
+        // Scanning inside ~/Library: the whole scan is off limits.
+        let root = Path::new("/Users/a/Library/Application Support");
+        assert_eq!(protected_in_tree(root, library.clone(), none), Some(root.to_path_buf()));
+        assert_eq!(protected_in_tree(Path::new("/Applications/Chat.app"), "/Applications".into(), none), Some("/Applications/Chat.app".into()));
+        // Scanning a project elsewhere: nothing protected in it.
+        assert_eq!(protected_in_tree(Path::new("/Users/a/code"), library, none), None);
+        // The startup disk is `/`, not part of /System; /Library on it is found by `within`.
+        let data = Path::new(DATA_VOLUME);
+        assert_eq!(protected_in_tree(data, "/System".into(), none), None);
+        let mapped = |p: PathBuf| Some(data.join(p.strip_prefix("/").unwrap()));
+        assert_eq!(protected_in_tree(data, "/Library".into(), mapped), Some(data.join("Library")));
+        assert_eq!(protected_in_tree(&data.join("Library/Caches"), "/Library".into(), none), Some(data.join("Library/Caches")));
     }
 
     #[test]
