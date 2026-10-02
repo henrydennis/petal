@@ -1,0 +1,33 @@
+name: Changesets
+
+# Keeps a "Version Packages" pull request open while there are unreleased changesets on main.
+# Merging it bumps the version everywhere and writes CHANGELOG.md; the DMG is still built,
+# notarised and uploaded by hand (scripts/bundle.sh --dmg).
+
+on:
+  push:
+    branches: [main]
+
+concurrency: ${{ github.workflow }}-${{ github.ref }}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Open or update the release pull request
+        # v2 is the action for Changesets v3.
+        uses: changesets/action@v2
+        with:
+          version-script: npm run version
+          pr-title: Version Packages
+          commit-message: Version Packages
