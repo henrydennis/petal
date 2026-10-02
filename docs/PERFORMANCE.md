@@ -75,6 +75,30 @@ hotspots lost their head start).
 - Early findings must equal their final sizes (`findings wrong 0`).
 - The total scan time must not regress (A/B with `bench/ab.sh`).
 
+## After the scan: staying current
+
+A full scan of a whole Mac re-reads about 3.4 GB of APFS metadata in 4 KB pieces (~880,000 reads),
+even right after the previous scan: the kernel's metadata buffer cache is ~64 MB (`kern.nbuf`
+16,384), so nothing stays cached between scans. Rather than rescanning, Petal follows changes.
+
+- The FSEvents position is noted **before** the walk starts; once the results are up, a stream from
+  that position (`src/watch.rs`) reports every folder that changed since, including during the scan.
+- Once a second, the changed folders are read again in the background, one listing each (new
+  subfolders are walked in full; macOS's "rescan below here" flag rescans that folder whole), and
+  the size change is carried up to the root. Focus, the Collector, findings and the startup disk's
+  volume slices are kept in step.
+- Measured with whole-disk results open for a minute: 52 updates, median **1.2 ms** each, slowest
+  later update 266 ms. The first update catches up on changes made during the scan while findings'
+  savings are still being worked out, and takes ~10 s.
+- Working out a finding's savings walks its folders again (seconds, for caches), and caches change
+  constantly. So a finding keeps its worked-out savings while its allocated size moves by under 1%
+  (or 64 MB); a real change, such as emptying the Trash, works them out again.
+- If macOS loses track (events dropped, the watched folder moved), the toolbar says the results are
+  out of date and a rescan is needed.
+
+**Gate:** `applied_changes_match_a_fresh_scan` adds, grows, renames and deletes files and folders,
+applies the changes folder by folder, and requires the tree to equal a fresh scan exactly.
+
 ## Progress and time left
 
 The bar counts items (files + folders) against the volume's object count, which `statfs` reports

@@ -94,6 +94,31 @@ impl Tree {
         }
     }
 
+    /// Whether `ix` is still part of the tree (not under a removed node).
+    pub fn is_attached(&self, mut ix: usize) -> bool {
+        while let Some(parent) = self.nodes[ix].parent {
+            ix = parent;
+        }
+        ix == Self::ROOT
+    }
+
+    /// The folder to read again for a path FSEvents reported: the folder itself if the
+    /// tree has it, else its parent (whose listing will pick up the new folder). Paths
+    /// outside the tree give `None`. On the startup disk the tree is rooted at the Data
+    /// volume, while events name its firmlinked paths (`/Users/…` for
+    /// `/System/Volumes/Data/Users/…`).
+    pub fn changed_folder(&self, path: &Path) -> Option<usize> {
+        let mapped;
+        let path = if path.starts_with(&self.root_path) {
+            path
+        } else {
+            mapped = self.root_path.join(path.strip_prefix("/").ok()?);
+            &mapped
+        };
+        let found = |path: &Path| self.find(path).filter(|&ix| self.nodes[ix].kind == Kind::Dir);
+        found(path).or_else(|| path.parent().and_then(found))
+    }
+
     /// Detach a node (after it was trashed) and subtract its size from its ancestors.
     pub fn remove(&mut self, ix: usize) {
         let Some(parent) = self.nodes[ix].parent else {
@@ -141,7 +166,8 @@ pub struct Progress {
     pub started: std::sync::OnceLock<std::time::Instant>,
 }
 
-struct Raw {
+/// A walked folder (or file), before it becomes tree nodes.
+pub struct Raw {
     name: String,
     size: u64,
     kind: Kind,
@@ -424,10 +450,9 @@ pub fn startup_disk_name() -> String {
         .unwrap_or_else(|| "Startup Disk".to_string())
 }
 
-/// `bases` locate the hotspot folders (none: no hotspot pass).
-fn scan_with_bases(root: &Path, progress: &Progress, bases: &findings::Bases) -> Tree {
-    let root_meta = fs::symlink_metadata(root).ok();
-    let mut allowed_devices: HashSet<u64> = root_meta.iter().map(|m| m.dev()).collect();
+/// A walker for the tree rooted at `root`: which devices and folders it may enter.
+fn walker<'a>(root: &Path, progress: &'a Progress) -> Walker<'a> {
+    let mut allowed_devices: HashSet<u64> = fs::symlink_metadata(root).iter().map(|m| m.dev()).collect();
     let mut skip: HashSet<PathBuf> = ["/dev", "/Volumes", "/System/Volumes", "/net", "/home"]
         .into_iter()
         .map(PathBuf::from)
@@ -442,14 +467,20 @@ fn scan_with_bases(root: &Path, progress: &Progress, bases: &findings::Bases) ->
         }
     }
 
-    let mut walker = Walker {
+    Walker {
         progress,
         allowed_devices,
         skip,
         hardlinks: Mutex::new(HashSet::new()),
         prescanned: Mutex::new(HashMap::new()),
         prescanned_paths: HashSet::new(),
-    };
+    }
+}
+
+/// `bases` locate the hotspot folders (none: no hotspot pass).
+fn scan_with_bases(root: &Path, progress: &Progress, bases: &findings::Bases) -> Tree {
+    let root_meta = fs::symlink_metadata(root).ok();
+    let mut walker = walker(root, progress);
     let own = root_meta.as_ref().map(disk_size).unwrap_or(0);
     dirlist::raise_fd_limit();
     dirlist::disable_cloud_downloads();
@@ -650,6 +681,209 @@ pub fn display_name(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
+/// A folder to read again because it changed on disk (see `watch`).
+pub struct Stale {
+    pub ix: usize,
+    pub path: PathBuf,
+    /// Rescan everything below it, not just its listing.
+    pub recursive: bool,
+    /// Its subfolders already in the tree; only new ones are walked.
+    pub known_dirs: HashSet<String>,
+}
+
+/// What a stale folder holds now.
+pub enum Fresh {
+    /// Gone (or unreadable).
+    Gone,
+    /// Rescanned whole.
+    Whole(Raw),
+    Listed {
+        /// The folder's own allocation.
+        own: u64,
+        /// (name, allocated size, link count)
+        files: Vec<(String, u64, u64)>,
+        /// Subfolders still there that the tree already has.
+        known_dirs: Vec<String>,
+        /// Subfolders that are new, walked in full.
+        new_dirs: Vec<Raw>,
+    },
+}
+
+/// Read changed folders again, off the UI thread, by the same rules as the scan that built
+/// the tree rooted at `root`. Errors met while walking new folders are added to `errors`.
+pub fn read_changes(root: &Path, stale: Vec<Stale>, errors: &AtomicU64) -> Vec<(usize, Fresh)> {
+    let progress = Progress::default();
+    let walker = walker(root, &progress);
+    dirlist::disable_cloud_downloads();
+    let below_live = LIVE_DEPTH + 1;
+    let fresh = stale
+        .into_par_iter()
+        .map(|stale| {
+            let started = std::time::Instant::now();
+            let path = stale.path.clone();
+            let result = read_one(&walker, &progress, stale, below_live);
+            if started.elapsed().as_millis() > 100 && std::env::var_os("PETAL_TIMING").is_some() {
+                eprintln!("  slow: {} took {:.1} s", path.display(), started.elapsed().as_secs_f64());
+            }
+            result
+        })
+        .collect();
+    errors.fetch_add(progress.errors.load(Ordering::Relaxed), Ordering::Relaxed);
+    fresh
+}
+
+/// One changed folder: listed (new subfolders walked in full), or rescanned whole.
+fn read_one(walker: &Walker, progress: &Progress, stale: Stale, below_live: usize) -> (usize, Fresh) {
+    let Some(own) = dirlist::dir_alloc(&stale.path) else { return (stale.ix, Fresh::Gone) };
+    let name = display_name(&stale.path);
+    if stale.recursive {
+        return (stale.ix, Fresh::Whole(walker.walk_dir(None, &stale.path, name, own, &progress.live, below_live)));
+    }
+    let Ok(listing) = dirlist::Dir::open(&stale.path).and_then(|dir| dir.list(&stale.path, false)) else {
+        return (stale.ix, Fresh::Gone);
+    };
+    let (mut files, mut known_dirs, mut new_dirs) = (Vec::new(), Vec::new(), Vec::new());
+    for entry in listing.entries {
+        let path = stale.path.join(&entry.name);
+        if !entry.is_dir {
+            files.push((entry.name, entry.size, entry.nlink));
+        } else if walker.skip.contains(&path) || !walker.allowed_devices.contains(&entry.dev) {
+            // Not part of the tree (another volume, a mount point): as in the scan.
+        } else if stale.known_dirs.contains(&entry.name) {
+            known_dirs.push(entry.name);
+        } else if entry.dataless {
+            new_dirs.push(Raw { name: entry.name, size: entry.size, kind: Kind::Dir, items: 0, children: Vec::new() });
+        } else {
+            new_dirs.push(walker.walk_dir(None, &path, entry.name, entry.size, &progress.live, below_live));
+        }
+    }
+    (stale.ix, Fresh::Listed { own, files, known_dirs, new_dirs })
+}
+
+/// Bring the tree up to date with what `read_changes` found, carrying each folder's size
+/// change up to the root. Returns how many folders changed.
+pub fn apply_changes(tree: &mut Tree, fresh: Vec<(usize, Fresh)>) -> usize {
+    let mut changed = 0;
+    for (ix, fresh) in fresh {
+        // A folder removed by an earlier change in this batch (or trashed meanwhile).
+        if !tree.is_attached(ix) {
+            continue;
+        }
+        let (old_size, old_items) = (tree.nodes[ix].size, tree.nodes[ix].items);
+        match fresh {
+            Fresh::Gone => {
+                if ix != Tree::ROOT {
+                    tree.remove(ix);
+                    changed += 1;
+                }
+                continue;
+            }
+            Fresh::Whole(raw) => {
+                // Volume slices ("macOS", "Not readable") under the root aren't on disk; keep them.
+                let (slices, old): (Vec<usize>, Vec<usize>) =
+                    std::mem::take(&mut tree.nodes[ix].children).into_iter().partition(|&c| tree.nodes[c].kind == Kind::Other);
+                for child in old {
+                    tree.nodes[child].parent = None;
+                }
+                let slices_size: u64 = slices.iter().map(|&c| tree.nodes[c].size).sum();
+                tree.nodes[ix].children = slices;
+                for child in raw.children {
+                    let child_ix = flatten(child, Some(ix), &mut tree.nodes);
+                    tree.nodes[ix].children.push(child_ix);
+                }
+                tree.nodes[ix].size = raw.size + slices_size;
+                tree.nodes[ix].items = raw.items;
+            }
+            Fresh::Listed { own, files, known_dirs, new_dirs } => {
+                let old: HashMap<(SharedString, bool), usize> = tree.nodes[ix]
+                    .children
+                    .iter()
+                    .map(|&c| ((tree.nodes[c].name.clone(), tree.nodes[c].kind == Kind::Dir), c))
+                    .collect();
+                // Volume slices ("macOS", "Not readable") under the root aren't on disk; keep them.
+                let mut children: Vec<usize> =
+                    tree.nodes[ix].children.iter().copied().filter(|&c| tree.nodes[c].kind == Kind::Other).collect();
+                for (name, size, nlink) in files {
+                    match old.get(&(SharedString::from(name.clone()), false)) {
+                        Some(&c) => {
+                            // A hard-linked file was counted once, wherever the scan met it
+                            // first; keep that decision rather than guess again.
+                            if nlink <= 1 {
+                                tree.nodes[c].size = size;
+                            }
+                            children.push(c);
+                        }
+                        None => {
+                            let raw = Raw { name, size, kind: Kind::File, items: 1, children: Vec::new() };
+                            children.push(flatten(raw, Some(ix), &mut tree.nodes));
+                        }
+                    }
+                }
+                for name in known_dirs {
+                    if let Some(&c) = old.get(&(SharedString::from(name), true)) {
+                        children.push(c);
+                    }
+                }
+                for raw in new_dirs {
+                    children.push(flatten(raw, Some(ix), &mut tree.nodes));
+                }
+                let kept: HashSet<usize> = children.iter().copied().collect();
+                for c in tree.nodes[ix].children.clone() {
+                    if !kept.contains(&c) {
+                        tree.nodes[c].parent = None;
+                    }
+                }
+                let size = own + children.iter().map(|&c| tree.nodes[c].size).sum::<u64>();
+                let items = children.iter().map(|&c| tree.nodes[c].items).sum();
+                let node = &mut tree.nodes[ix];
+                node.children = children;
+                node.size = size;
+                node.items = items;
+            }
+        }
+        sort_children(&mut tree.nodes, ix);
+        let (size, items) = (tree.nodes[ix].size, tree.nodes[ix].items);
+        let mut at = tree.nodes[ix].parent;
+        while let Some(p) = at {
+            let node = &mut tree.nodes[p];
+            node.size = (node.size + size).saturating_sub(old_size);
+            node.items = (node.items + items).saturating_sub(old_items);
+            sort_children(&mut tree.nodes, p);
+            at = tree.nodes[p].parent;
+        }
+        changed += 1;
+    }
+    changed
+}
+
+/// On the startup disk, refresh the exact per-volume slices so the chart still adds up to
+/// the disk's used space after changes.
+pub fn refresh_volume_slices(tree: &mut Tree) {
+    let Some(layout) = disk::startup_layout(startup_disk_name()) else { return };
+    if layout.data_root != tree.root_path {
+        return;
+    }
+    let root = &tree.nodes[Tree::ROOT];
+    let slices: Vec<usize> = root.children.iter().copied().filter(|&c| tree.nodes[c].kind == Kind::Other).collect();
+    let scanned = root.size - slices.iter().map(|&c| tree.nodes[c].size).sum::<u64>();
+    let unreadable = layout.data_used.saturating_sub(scanned);
+    let mut total = scanned;
+    for (name, size) in layout.extras.iter().cloned().chain(std::iter::once((disk::NOT_READABLE.to_string(), unreadable))) {
+        match slices.iter().find(|&&c| tree.nodes[c].name.as_ref() == name) {
+            Some(&c) => tree.nodes[c].size = size,
+            None if size > 0 => {
+                let ix = tree.nodes.len();
+                tree.nodes.push(Node { name: name.into(), size, kind: Kind::Other, parent: Some(Tree::ROOT), children: Vec::new(), items: 0 });
+                tree.nodes[Tree::ROOT].children.push(ix);
+            }
+            None => {}
+        }
+        total += size;
+    }
+    tree.nodes[Tree::ROOT].size = total;
+    sort_children(&mut tree.nodes, Tree::ROOT);
+}
+
 fn flatten(raw: Raw, parent: Option<usize>, nodes: &mut Vec<Node>) -> usize {
     let ix = nodes.len();
     nodes.push(Node {
@@ -767,6 +1001,107 @@ mod tests {
     fn write(path: &Path, bytes: usize) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, vec![7u8; bytes]).unwrap();
+    }
+
+    /// Every attached node as (path, kind, size, items), for comparing trees exactly.
+    fn fingerprint(tree: &Tree) -> Vec<(PathBuf, String, u64, u64)> {
+        let mut out = Vec::new();
+        let mut stack = vec![Tree::ROOT];
+        while let Some(ix) = stack.pop() {
+            let node = &tree.nodes[ix];
+            out.push((tree.path_of(ix), format!("{:?}", node.kind), node.size, node.items));
+            stack.extend(node.children.iter().copied());
+        }
+        out.sort();
+        out
+    }
+
+    /// The folders FSEvents would report for these changes, as `Stale` entries.
+    fn stale(tree: &Tree, folders: &[(&Path, bool)]) -> Vec<Stale> {
+        folders
+            .iter()
+            .map(|&(path, recursive)| {
+                let ix = tree.changed_folder(path).unwrap();
+                let known_dirs = tree.nodes[ix]
+                    .children
+                    .iter()
+                    .filter(|&&c| tree.nodes[c].kind == Kind::Dir)
+                    .map(|&c| tree.nodes[c].name.to_string())
+                    .collect();
+                Stale { ix, path: tree.path_of(ix), recursive, known_dirs }
+            })
+            .collect()
+    }
+
+    /// Applying changes folder by folder must give exactly what a fresh scan gives.
+    #[test]
+    fn applied_changes_match_a_fresh_scan() {
+        let dir = std::env::temp_dir().join(format!("petal-changes-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let dir = {
+            fs::create_dir_all(&dir).unwrap();
+            dir.canonicalize().unwrap()
+        };
+        write(&dir.join("a/grows.bin"), 10_000);
+        write(&dir.join("a/old-name/inside.bin"), 30_000);
+        write(&dir.join("b/goes.bin"), 50_000);
+        write(&dir.join("b/sub/deep/x.bin"), 70_000);
+        write(&dir.join("b/stays.bin"), 5_000);
+        write(&dir.join("whole/one/two/three.bin"), 90_000);
+        let mut tree = scan(&dir, &Progress::default());
+
+        write(&dir.join("a/new.bin"), 20_000);
+        write(&dir.join("a/grows.bin"), 400_000);
+        fs::rename(dir.join("a/old-name"), dir.join("a/new-name")).unwrap();
+        fs::remove_file(dir.join("b/goes.bin")).unwrap();
+        fs::remove_dir_all(dir.join("b/sub")).unwrap();
+        write(&dir.join("c/d/e/f.bin"), 60_000);
+        write(&dir.join("whole/one/two/four.bin"), 80_000);
+        fs::remove_file(dir.join("whole/one/two/three.bin")).unwrap();
+
+        let changed = [(dir.join("a"), false), (dir.join("b"), false), (dir.clone(), false), (dir.join("whole"), true)];
+        let changed: Vec<(&Path, bool)> = changed.iter().map(|(p, r)| (p.as_path(), *r)).collect();
+        let fresh = read_changes(&tree.root_path, stale(&tree, &changed), &AtomicU64::new(0));
+        assert_eq!(apply_changes(&mut tree, fresh), 4);
+
+        let rescanned = scan(&dir, &Progress::default());
+        assert_eq!(fingerprint(&tree), fingerprint(&rescanned));
+        let sizes: Vec<u64> = tree.nodes[Tree::ROOT].children.iter().map(|&c| tree.nodes[c].size).collect();
+        assert!(sizes.windows(2).all(|w| w[0] >= w[1]), "children stay sorted");
+
+        // A folder that's gone is dropped from its parent, and its size with it.
+        fs::remove_dir_all(dir.join("c")).unwrap();
+        let fresh = read_changes(&tree.root_path, stale(&tree, &[(&dir.join("c/d"), false), (&dir, false)]), &AtomicU64::new(0));
+        apply_changes(&mut tree, fresh);
+        assert_eq!(fingerprint(&tree), fingerprint(&scan(&dir, &Progress::default())));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Events name firmlinked paths; on the startup disk the tree lives under the Data volume.
+    #[test]
+    fn changed_folder_maps_event_paths() {
+        let mut nodes = Vec::new();
+        let mut push = |name: &str, kind: Kind, parent: Option<usize>| {
+            let ix = nodes.len();
+            nodes.push(Node { name: name.into(), size: 0, kind, parent, children: Vec::new(), items: 0 });
+            if let Some(p) = parent {
+                nodes[p].children.push(ix);
+            }
+            ix
+        };
+        let root = push("Macintosh HD", Kind::Dir, None);
+        let users = push("Users", Kind::Dir, Some(root));
+        let sam = push("sam", Kind::Dir, Some(users));
+        push("notes.txt", Kind::File, Some(sam));
+        let tree = Tree { root_path: PathBuf::from("/System/Volumes/Data"), nodes, errors: 0, cloud_only: 0 };
+        assert_eq!(tree.changed_folder(Path::new("/Users/sam")), Some(sam));
+        assert_eq!(tree.changed_folder(Path::new("/System/Volumes/Data/Users/sam")), Some(sam));
+        // A new folder: its parent is read again and picks it up.
+        assert_eq!(tree.changed_folder(Path::new("/Users/sam/new-folder")), Some(sam));
+        // A file's path isn't a folder to list; nor is anything outside the tree.
+        assert_eq!(tree.changed_folder(Path::new("/Users/sam/notes.txt")), Some(sam));
+        assert_eq!(tree.changed_folder(Path::new("/Volumes/USB/stuff")), None);
     }
 
     #[test]

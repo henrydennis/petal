@@ -26,6 +26,7 @@ use crate::live;
 use crate::motion;
 use crate::scan::{self, Kind, Progress, Tree, Volume, format_count, format_size};
 use crate::sunburst::{self, Geometry, Hit, Segment, Target};
+use crate::watch;
 
 actions!(petal, [GoUp, OpenFolder, Rescan, StartOver]);
 
@@ -118,6 +119,10 @@ struct LiveView {
 }
 
 static NEXT_LAYOUT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// Identifies a set of results, so a check for changes from an earlier scan stops.
+static NEXT_RESULTS_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// How often to check for changes on disk once the results are up.
+const WATCH_INTERVAL: Duration = Duration::from_secs(1);
 
 const LIVE_REFRESH: Duration = Duration::from_millis(100);
 /// How long a folder glows after its total becomes final.
@@ -250,6 +255,15 @@ struct Results {
     legend_hover: Option<Category>,
     /// Folders that look like someone's home folder (`home_folders`).
     homes: Vec<usize>,
+    id: u64,
+    /// Follows changes on disk since the scan started (see `watch`).
+    watch: Option<watch::Watch>,
+    /// Changed folders are being read again in the background.
+    refreshing: bool,
+    /// macOS lost track of changes; only a rescan can be trusted.
+    out_of_date: bool,
+    /// Findings whose savings are being worked out right now, by title and folders.
+    surveying: Vec<(&'static str, Vec<usize>)>,
 }
 
 impl Results {
@@ -275,6 +289,11 @@ impl Results {
             categories: HashMap::new(),
             legend_hover: None,
             homes: Vec::new(),
+            id: NEXT_RESULTS_ID.fetch_add(1, Ordering::Relaxed),
+            watch: None,
+            refreshing: false,
+            out_of_date: false,
+            surveying: Vec::new(),
         };
         results.homes = home_folders(&results.tree);
         results.relayout();
@@ -553,6 +572,8 @@ impl Petal {
         onboarding::mark_first_run_done();
         let progress = Arc::new(Progress::default());
         let started = clock::now();
+        // Before walking anything, so changes made during the scan are caught up on after.
+        let since = watch::current_event_id();
 
         let scan_task = cx.spawn({
             let progress = progress.clone();
@@ -586,8 +607,11 @@ impl Petal {
                         // The chart is already on screen from the scan; don't replay the sweep.
                         results.anim_start = clock::now() - ZOOM_DURATION;
                         results.banner = Some(clock::now());
+                        results.watch = watch::Watch::start(&results.requested_root, since);
+                        let id = results.id;
                         this.screen = Screen::Results(results);
                         this.resolve_pending_findings(cx);
+                        this.follow_changes(id, cx);
                         // A light tap (felt only with a finger on a Force Touch trackpad).
                         cx.play_haptic_feedback(HapticFeedbackStyle::LevelChange);
                         cx.spawn(async move |this, cx| {
@@ -742,6 +766,132 @@ impl Petal {
     }
 
     /// Work out what the Collector frees, off the UI thread.
+    /// Check for changes on disk every second while these results are up.
+    fn follow_changes(&mut self, id: u64, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(WATCH_INTERVAL).await;
+                let keep_going = this.update(cx, |this, cx| this.check_changes(id, cx)).unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Read changed folders again in the background. Returns false once these results are gone.
+    fn check_changes(&mut self, id: u64, cx: &mut Context<Self>) -> bool {
+        let Some(r) = self.results() else { return false };
+        if r.id != id {
+            return false;
+        }
+        let Some(watch) = &r.watch else { return false };
+        if r.refreshing {
+            return true;
+        }
+        let pending = watch.take();
+        if pending.lost && !r.out_of_date {
+            r.out_of_date = true;
+            cx.notify();
+        }
+        let mut folders: HashMap<usize, bool> = HashMap::new();
+        for change in pending.changes {
+            if let Some(ix) = r.tree.changed_folder(&change.path) {
+                *folders.entry(ix).or_default() |= change.recursive;
+            }
+        }
+        // Anything inside a folder that's being rescanned whole comes along with it.
+        let whole: Vec<usize> = folders.iter().filter(|&(_, &recursive)| recursive).map(|(&ix, _)| ix).collect();
+        folders.retain(|&ix, _| !whole.iter().any(|&w| w != ix && r.tree.is_ancestor_or_self(w, ix)));
+        if folders.is_empty() {
+            return true;
+        }
+        let tree = &r.tree;
+        let stale: Vec<scan::Stale> = folders
+            .into_iter()
+            .map(|(ix, recursive)| scan::Stale {
+                ix,
+                path: tree.path_of(ix),
+                recursive,
+                known_dirs: tree.nodes[ix].children.iter().filter(|&&c| tree.nodes[c].kind == Kind::Dir).map(|&c| tree.nodes[c].name.to_string()).collect(),
+            })
+            .collect();
+        let root = tree.root_path.clone();
+        r.refreshing = true;
+        cx.spawn(async move |this, cx| {
+            let (fresh, errors) = cx
+                .background_spawn(async move {
+                    let (count, whole, started) = (stale.len(), stale.iter().filter(|s| s.recursive).count(), Instant::now());
+                    let errors = std::sync::atomic::AtomicU64::new(0);
+                    let fresh = scan::read_changes(&root, stale, &errors);
+                    if std::env::var_os("PETAL_TIMING").is_some() {
+                        eprintln!("changes: read {count} folders ({whole} whole) in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
+                    }
+                    (fresh, errors.into_inner())
+                })
+                .await;
+            this.update(cx, |this, cx| this.apply_fresh(id, fresh, errors, cx)).ok();
+        })
+        .detach();
+        true
+    }
+
+    /// Fold re-read folders into the tree, and keep the focus, Collector and findings in step.
+    fn apply_fresh(&mut self, id: u64, fresh: Vec<(usize, scan::Fresh)>, errors: u64, cx: &mut Context<Self>) {
+        let Some(r) = self.results() else { return };
+        if r.id != id {
+            return;
+        }
+        r.refreshing = false;
+        let touched: Vec<usize> = fresh.iter().map(|(ix, _)| *ix).collect();
+        let focus_path = path_to(&r.tree, r.focus);
+        if scan::apply_changes(&mut r.tree, fresh) == 0 {
+            return;
+        }
+        r.tree.errors += errors;
+        if r.requested_root == std::path::Path::new("/") {
+            scan::refresh_volume_slices(&mut r.tree);
+        }
+        // A folder that's gone (or renamed) leaves the view at its nearest surviving parent.
+        r.focus = resolve_path(&r.tree, &focus_path);
+        r.chart_hover = None;
+        r.list_hover = r.list_hover.filter(|&ix| r.tree.is_attached(ix));
+
+        let inside = |tree: &Tree, folder: usize| touched.iter().any(|&t| tree.is_ancestor_or_self(folder, t));
+        let collected = r.collector.len();
+        r.collector.retain(|&c| r.tree.is_attached(c));
+        let collector_changed = r.collector.len() != collected || r.collector.iter().any(|&c| inside(&r.tree, c));
+        let findings_changed = r.findings.iter().any(|f| f.nodes.iter().any(|&n| !r.tree.is_attached(n) || inside(&r.tree, n)));
+        if findings_changed {
+            let mut fresh = findings::from_tree(&r.tree, &findings::Bases::for_root(&r.tree.root_path));
+            // Working out savings means walking the folders again (seconds, for caches), so
+            // keep a finding's worked-out savings while its size has barely moved; a real
+            // change (say, the Trash emptied) works them out again.
+            for finding in &mut fresh {
+                let same = r.findings.iter().find(|old| !old.pending && old.title == finding.title && old.nodes == finding.nodes);
+                if let Some(old) = same {
+                    let drift = old.allocated.abs_diff(finding.allocated);
+                    if drift <= (old.allocated / 100).max(64 << 20) {
+                        finding.size = old.size;
+                        finding.allocated = old.allocated;
+                        finding.pending = false;
+                    }
+                }
+            }
+            fresh.sort_by(|a, b| b.size.cmp(&a.size));
+            r.findings = fresh;
+        }
+        r.relayout();
+        if findings_changed {
+            self.resolve_pending_findings(cx);
+        }
+        if collector_changed {
+            self.collector_changed(cx);
+        }
+        cx.notify();
+    }
+
     fn collector_changed(&mut self, cx: &mut Context<Self>) {
         let Some(r) = self.results() else { return };
         r.collector_version += 1;
@@ -770,13 +920,23 @@ impl Petal {
     /// Findings whose real saving needs a clone survey (e.g. node_modules).
     fn resolve_pending_findings(&mut self, cx: &mut Context<Self>) {
         let Some(r) = self.results() else { return };
-        for (i, finding) in r.findings.iter().enumerate().filter(|(_, f)| f.pending) {
+        let mut started = Vec::new();
+        for finding in r.findings.iter().filter(|f| f.pending) {
+            // Matched by what it is, not its position: changes on disk can rebuild the list
+            // while this is still working.
+            let key = (finding.title, finding.nodes.clone());
+            if r.surveying.contains(&key) || started.contains(&key) {
+                continue;
+            }
+            started.push(key.clone());
+            let (title, nodes) = key.clone();
             let paths: Vec<PathBuf> = finding.nodes.iter().map(|&ix| r.tree.path_of(ix)).collect();
             cx.spawn(async move |this, cx| {
                 let frees = cx.background_spawn(async move { scan::frees_of(&paths) }).await;
                 this.update(cx, |this, cx| {
                     if let Some(r) = this.results() {
-                        if let Some(finding) = r.findings.get_mut(i) {
+                        r.surveying.retain(|k| *k != key);
+                        if let Some(finding) = r.findings.iter_mut().find(|f| f.pending && f.title == title && f.nodes == nodes) {
                             finding.size = frees;
                             finding.pending = false;
                         }
@@ -788,6 +948,7 @@ impl Petal {
             })
             .detach();
         }
+        r.surveying.extend(started);
     }
 
     /// For the recorder: has the scan finished?
@@ -1055,10 +1216,11 @@ impl Petal {
                 bar = bar
                     .child(color_toggle(r.color_by, cx))
                     .child(
-                        div().text_xs().text_color(rgb(MUTED)).flex_none().child(format!(
-                            "Scanned in {:.1}s",
-                            r.elapsed.as_secs_f32()
-                        )),
+                        div().text_xs().text_color(rgb(MUTED)).flex_none().child(if r.out_of_date {
+                            "Out of date · rescan to refresh".to_string()
+                        } else {
+                            format!("Scanned in {:.1}s", r.elapsed.as_secs_f32())
+                        }),
                     )
                     .child(
                         button("rescan", "Rescan")

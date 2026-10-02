@@ -64,6 +64,8 @@ pub struct Finding {
     pub blurb: String,
     pub safety: Safety,
     pub size: u64,
+    /// Allocated size of its folders when it was built; what `size` was worked out from.
+    pub allocated: u64,
     /// The folder, for a single-location finding.
     pub path: Option<PathBuf>,
     /// Every folder involved (one for a location, many for e.g. node_modules).
@@ -94,6 +96,7 @@ pub fn early_findings(early: &[Early]) -> Vec<Finding> {
                 blurb: category.blurb.to_string(),
                 safety: category.safety,
                 size: e.size,
+                allocated: e.size,
                 path: Some(e.path.clone()),
                 nodes: Vec::new(),
                 pending: false,
@@ -124,6 +127,7 @@ fn from_tree_min(tree: &Tree, bases: &Bases, min_size: u64) -> Vec<Finding> {
                     blurb: category.blurb.to_string(),
                     safety: category.safety,
                     size,
+                    allocated: size,
                     path: Some(path),
                     nodes: vec![ix],
                     pending: true,
@@ -157,6 +161,7 @@ fn from_tree_min(tree: &Tree, bases: &Bases, min_size: u64) -> Vec<Finding> {
             blurb: format!("In {} projects; reinstall with your package manager", modules.len()),
             safety: Safety::Safe,
             size,
+            allocated: size,
             path: None,
             nodes: modules,
             pending: true,
