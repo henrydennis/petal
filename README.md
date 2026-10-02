@@ -70,7 +70,7 @@ will free.
 
 ### Download
 
-**[Download Petal 0.1.0 (DMG, 5.5 MB)](https://github.com/henrydennis/petal/releases/latest/download/Petal-0.1.0.dmg)** for Macs
+**[Download Petal 0.2.0 (DMG, 5.5 MB)](https://github.com/henrydennis/petal/releases/latest/download/Petal-0.2.0.dmg)** for Macs
 with Apple silicon (M1 or later) running macOS 13 or later.
 
 1. Open the DMG and drag **Petal** into **Applications**.
