@@ -1,4 +1,5 @@
 mod app;
+mod classify;
 mod clock;
 mod dirlist;
 mod disk;

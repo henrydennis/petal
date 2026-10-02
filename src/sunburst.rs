@@ -109,6 +109,17 @@ pub fn dim(color: Hsla) -> Hsla {
     hsla(hue_turns(&color), color.saturation * 0.8, color.lightness * 0.82, 1.0)
 }
 
+/// Highlight for colours that are already vivid (colouring by kind): lighter, without
+/// pushing saturation, which turns a pure green neon.
+pub fn lift(color: Hsla) -> Hsla {
+    hsla(hue_turns(&color), color.saturation.min(0.8), (color.lightness + 0.1).min(0.85), 1.0)
+}
+
+/// Much quieter than `dim`, so one highlighted group stands out from everything else.
+pub fn fade(color: Hsla) -> Hsla {
+    hsla(hue_turns(&color), color.saturation * 0.3, color.lightness * 0.6, 1.0)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Geometry {
     pub center: Point<Pixels>,

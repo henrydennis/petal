@@ -16,6 +16,7 @@ use gpui::{
 
 use palette::IntoColor;
 
+use crate::classify::{self, CATEGORIES, Category};
 use crate::clock;
 use crate::disk;
 use crate::eta;
@@ -40,6 +41,15 @@ const DANGER: u32 = 0xe5484d;
 
 const ROW_HEIGHT: f32 = 30.0;
 const ZOOM_DURATION: Duration = Duration::from_millis(450);
+
+/// How the chart is coloured.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColorBy {
+    /// Each slice its own hue around the circle, so neighbouring folders stand apart.
+    Folder,
+    /// By what things are: apps, caches, photos… (see `classify`).
+    Kind,
+}
 
 #[derive(Clone)]
 struct DraggedItem {
@@ -232,10 +242,18 @@ struct Results {
     collector_version: u64,
     /// Set when the scan has just finished: show the "scan complete" banner.
     banner: Option<Instant>,
+    color_by: ColorBy,
+    /// What each node is, for colouring by kind. Filled in as nodes appear in the chart;
+    /// node indices stay valid for the life of the tree, so nothing is classified twice.
+    categories: HashMap<usize, Category>,
+    /// The kind under the pointer in the chart's legend: the chart highlights just that.
+    legend_hover: Option<Category>,
+    /// Folders that look like someone's home folder (`home_folders`).
+    homes: Vec<usize>,
 }
 
 impl Results {
-    fn new(tree: Tree, findings: Vec<Finding>, elapsed: Duration, requested_root: PathBuf) -> Self {
+    fn new(tree: Tree, findings: Vec<Finding>, elapsed: Duration, requested_root: PathBuf, color_by: ColorBy) -> Self {
         let mut results = Self {
             tree,
             focus: Tree::ROOT,
@@ -253,21 +271,59 @@ impl Results {
             collector_frees: Cell::new(None),
             collector_version: 0,
             banner: None,
+            color_by,
+            categories: HashMap::new(),
+            legend_hover: None,
+            homes: Vec::new(),
         };
+        results.homes = home_folders(&results.tree);
         results.relayout();
         results
     }
 
     fn relayout(&mut self) {
         let segments = sunburst::layout(&self.tree, self.focus);
+        if self.color_by == ColorBy::Kind {
+            for s in &segments {
+                if let Target::Node(ix) = s.target {
+                    let (tree, homes) = (&self.tree, &self.homes);
+                    self.categories.entry(ix).or_insert_with(|| category_of(tree, homes, ix));
+                }
+            }
+        }
         self.swatches = segments
             .iter()
             .filter_map(|s| match s.target {
-                Target::Node(ix) if s.depth == 1 => Some((ix, sunburst::base_color(s))),
+                Target::Node(ix) if s.depth == 1 => Some((ix, self.color(s))),
                 _ => None,
             })
             .collect();
         self.segments = Rc::new(segments);
+    }
+
+    fn set_color_by(&mut self, color_by: ColorBy) {
+        self.color_by = color_by;
+        self.legend_hover = None;
+        self.relayout();
+    }
+
+    fn category(&self, target: Target) -> Option<Category> {
+        match target {
+            Target::Node(ix) => self.categories.get(&ix).copied(),
+            Target::Small { .. } => None,
+        }
+    }
+
+    fn color(&self, segment: &Segment) -> Hsla {
+        match (self.color_by, self.category(segment.target)) {
+            (ColorBy::Kind, Some(category)) => {
+                let base = classify::color(category);
+                // A touch lighter per ring, so nested folders of the same kind stay apart.
+                let lightness = (base.lightness + 0.015 * (segment.depth - 1) as f32).min(0.9);
+                gpui::hsla(base.hue.into_positive_degrees() / 360.0, base.saturation, lightness, 1.0)
+            }
+            _ => sunburst::base_color(segment),
+        }
     }
 
     fn navigate(&mut self, ix: usize) {
@@ -311,6 +367,48 @@ impl Results {
 
 }
 
+/// What a node is. The APFS volume slices are the system's; the unscanned or unreadable
+/// remainder could be anything.
+fn category_of(tree: &Tree, homes: &[usize], ix: usize) -> Category {
+    let node = &tree.nodes[ix];
+    let path = match node.kind {
+        Kind::Other if [disk::NOT_SCANNED, disk::NOT_READABLE].contains(&node.name.as_ref()) => return Category::Mixed,
+        Kind::Other => return Category::System,
+        _ => {
+            // Inside a home folder, describe the path from it (`~/…`) wherever the home
+            // folder lives, as the classifier expects.
+            let chain = tree.ancestry(ix);
+            match chain.iter().rposition(|a| homes.contains(a)) {
+                Some(home) => chain[home + 1..].iter().fold(PathBuf::from("~"), |path, &a| path.join(tree.nodes[a].name.as_ref())),
+                None => tree.path_of(ix),
+            }
+        }
+    };
+    classify::classify(&path, node.kind == Kind::File)
+}
+
+/// Folders near the top of the tree that look like a home folder: a Library and at least
+/// two of the usual Desktop, Documents, Downloads, Movies, Music, Pictures. That finds
+/// the user's own (`/Users/<name>`) and also one scanned on a backup disk or a copy.
+fn home_folders(tree: &Tree) -> Vec<usize> {
+    const USUAL: [&str; 6] = ["Desktop", "Documents", "Downloads", "Movies", "Music", "Pictures"];
+    let mut homes = Vec::new();
+    let mut level = vec![Tree::ROOT];
+    for _ in 0..4 {
+        let mut next = Vec::new();
+        for &ix in &level {
+            let names: Vec<&str> = tree.nodes[ix].children.iter().map(|&c| tree.nodes[c].name.as_ref()).collect();
+            if names.contains(&"Library") && USUAL.iter().filter(|u| names.contains(u)).count() >= 2 {
+                homes.push(ix);
+                continue;
+            }
+            next.extend(tree.nodes[ix].children.iter().copied().filter(|&c| tree.nodes[c].kind == Kind::Dir));
+        }
+        level = next;
+    }
+    homes
+}
+
 /// Shows paths in the home folder as `~/…`, as the shell does.
 fn abbreviate_home(path: &str) -> String {
     let Ok(home) = std::env::var("HOME") else { return path.to_string() };
@@ -341,6 +439,8 @@ pub struct Petal {
     error: Option<String>,
     access: Access,
     _access_watch: Option<Task<()>>,
+    /// Kept here rather than on the results, so a rescan keeps the user's choice.
+    color_by: ColorBy,
 }
 
 impl Petal {
@@ -357,6 +457,7 @@ impl Petal {
             error: None,
             access,
             _access_watch: None,
+            color_by: ColorBy::Folder,
         };
         if access == Access::Missing {
             this._access_watch = Some(this.watch_access(cx));
@@ -477,7 +578,7 @@ impl Petal {
                             Screen::Scanning(scanning) => scanning.focus.clone(),
                             _ => Vec::new(),
                         };
-                        let mut results = Results::new(tree, findings, clock::since(started), root_for_results);
+                        let mut results = Results::new(tree, findings, clock::since(started), root_for_results, this.color_by);
                         let ix = resolve_path(&results.tree, &focus);
                         if ix != Tree::ROOT {
                             results.navigate(ix);
@@ -700,6 +801,14 @@ impl Petal {
             Screen::Results(r) => Some(r),
             _ => None,
         }
+    }
+
+    fn set_color_by(&mut self, color_by: ColorBy, cx: &mut Context<Self>) {
+        self.color_by = color_by;
+        if let Some(r) = self.results() {
+            r.set_color_by(color_by);
+        }
+        cx.notify();
     }
 
     fn set_chart_hover(&mut self, hit: Option<Hit>, cx: &mut Context<Self>) {
@@ -944,6 +1053,7 @@ impl Petal {
                 }
                 bar = bar.child(crumbs).child(div().flex_1());
                 bar = bar
+                    .child(color_toggle(r.color_by, cx))
                     .child(
                         div().text_xs().text_color(rgb(MUTED)).flex_none().child(format!(
                             "Scanned in {:.1}s",
@@ -1803,7 +1913,10 @@ impl Petal {
             .segments
             .iter()
             .map(|s| {
-                let base = sunburst::base_color(s);
+                let base = r.color(s);
+                if let Some(category) = r.legend_hover {
+                    return if r.category(s.target) == Some(category) { sunburst::lift(base) } else { sunburst::fade(base) };
+                }
                 let Some(target) = hovered else { return base };
                 let lit = match (s.target, target) {
                     (a, b) if a == b => true,
@@ -1811,7 +1924,11 @@ impl Petal {
                     (Target::Small { parent }, Target::Node(h)) => tree.is_ancestor_or_self(h, parent),
                     _ => false,
                 };
-                if lit { sunburst::highlight(base) } else { sunburst::dim(base) }
+                match (lit, r.color_by) {
+                    (true, ColorBy::Folder) => sunburst::highlight(base),
+                    (true, ColorBy::Kind) => sunburst::lift(base),
+                    (false, _) => sunburst::dim(base),
+                }
             })
             .collect();
 
@@ -1833,7 +1950,11 @@ impl Petal {
                     Kind::Other if node.name.as_ref() == disk::NOT_READABLE => "needs Full Disk Access".into(),
                     Kind::Other => "exact, from APFS".into(),
                 };
-                (node.name.clone(), format!("{}\n{}", format_size(node.size), detail))
+                let kind = match r.category(Target::Node(ix)) {
+                    Some(category) if r.color_by == ColorBy::Kind && node.kind != Kind::Other => format!("\n{}", category.label()),
+                    _ => String::new(),
+                };
+                (node.name.clone(), format!("{}\n{detail}{kind}", format_size(node.size)))
             }
             Some(Target::Small { parent }) => {
                 let seg_size: u64 = tree.nodes[parent]
@@ -1951,6 +2072,7 @@ impl Petal {
                             })),
                     ),
             )
+            .when(r.color_by == ColorBy::Kind, |d| d.child(render_legend(r, cx)))
             .when(r.banner.is_some(), |d| {
                 // The "done" moment: what the scan found, in one line.
                 let total = tree.nodes[Tree::ROOT].size;
@@ -1991,6 +2113,79 @@ impl Petal {
                 )
             })
     }
+}
+
+/// "Colour: Folder | Kind" in the toolbar.
+fn color_toggle(current: ColorBy, cx: &mut Context<Petal>) -> impl IntoElement {
+    let option = |id: &'static str, label: &'static str, value: ColorBy, cx: &mut Context<Petal>| {
+        let selected = current == value;
+        div()
+            .id(id)
+            .px_2()
+            .py_0p5()
+            .rounded_md()
+            .cursor_pointer()
+            .when(selected, |d| d.bg(rgb(CARD_HOVER)).text_color(rgb(TEXT)))
+            .when(!selected, |d| d.text_color(rgb(MUTED)).hover(|s| s.text_color(rgb(TEXT))))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| this.set_color_by(value, cx)))
+            .child(label)
+    };
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap_0p5()
+        .p_0p5()
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(BORDER))
+        .text_xs()
+        .child(div().pl_1p5().pr_0p5().text_color(rgb(MUTED)).child("Colour"))
+        .child(option("color-folder", "Folder", ColorBy::Folder, cx))
+        .child(option("color-kind", "Kind", ColorBy::Kind, cx))
+}
+
+/// Which colour means which kind, for the kinds in view. Hover a kind to highlight it.
+fn render_legend(r: &Results, cx: &mut Context<Petal>) -> impl IntoElement {
+    let mut legend = div()
+        .absolute()
+        .left_4()
+        .bottom_4()
+        .flex()
+        .flex_col()
+        .gap_0p5()
+        .p_2()
+        .rounded_lg()
+        .bg(rgb(PANEL))
+        .border_1()
+        .border_color(rgb(BORDER))
+        .text_xs();
+    for category in CATEGORIES.into_iter().filter(|&c| r.segments.iter().any(|s| r.category(s.target) == Some(c))) {
+        let lit = r.legend_hover.is_none_or(|h| h == category);
+        legend = legend.child(
+            div()
+                .id(("legend", category as usize))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_1()
+                .text_color(rgb(if lit { TEXT } else { MUTED }))
+                .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
+                    if let Some(r) = this.results() {
+                        if *hovering {
+                            r.legend_hover = Some(category);
+                        } else if r.legend_hover == Some(category) {
+                            r.legend_hover = None;
+                        }
+                        cx.notify();
+                    }
+                }))
+                .child(div().size(px(10.)).flex_none().rounded_full().bg(classify::color(category)))
+                .child(category.label()),
+        );
+    }
+    legend
 }
 
 fn icon_button(id: impl Into<gpui::ElementId>, glyph: &'static str, _tooltip: &'static str) -> Stateful<gpui::Div> {

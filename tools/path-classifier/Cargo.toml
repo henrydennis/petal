@@ -1,0 +1,12 @@
+[package]
+name = "path-classifier"
+version = "0.1.0"
+edition = "2024"
+description = "Experiment: classify paths as safe / review / keep for deletion with a tiny model"
+license = "MIT"
+publish = false
+
+[dependencies]
+
+[profile.release]
+debug = false
