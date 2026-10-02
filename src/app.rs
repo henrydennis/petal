@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -8,10 +8,10 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, Bounds, Context, CursorStyle, DispatchPhase, FocusHandle, FontWeight, HapticFeedbackStyle, HitboxBehavior,
+    App, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase, FocusHandle, FontWeight, HapticFeedbackStyle, HitboxBehavior,
     Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, PathPromptOptions, Pixels,
     PromptLevel, Rgba, ScrollStrategy, SharedString, Stateful, Task, UniformListScrollHandle,
-    Window, actions, canvas, div, prelude::*, px, relative, rgb, uniform_list,
+    Window, actions, canvas, div, prelude::*, px, relative, rgb, rgba, uniform_list,
 };
 
 use palette::IntoColor;
@@ -21,7 +21,7 @@ use crate::clock;
 use crate::disk;
 use crate::eta;
 use crate::onboarding;
-use crate::findings::{self, Finding, Safety};
+use crate::findings::{self, Finding, Fix, Safety};
 use crate::live;
 use crate::motion;
 use crate::scan::{self, Kind, Progress, Tree, Volume, format_count, format_size};
@@ -39,6 +39,9 @@ const TEXT: u32 = 0xe8e9ec;
 const MUTED: u32 = 0x8d919a;
 const ACCENT: u32 = 0x4f9dff;
 const DANGER: u32 = 0xe5484d;
+/// ACCENT, faint: the background of something already in the Collector.
+const ACCENT_TINT: u32 = 0x4f9dff1f;
+const SAFE: u32 = 0x3fb950;
 
 const ROW_HEIGHT: f32 = 30.0;
 const ZOOM_DURATION: Duration = Duration::from_millis(450);
@@ -50,6 +53,33 @@ enum ColorBy {
     Folder,
     /// By what things are: apps, caches, photos… (see `classify`).
     Kind,
+}
+
+/// How long a notice ("Copied …") stays up.
+const NOTICE_TIME: Duration = Duration::from_millis(2500);
+
+/// The label shown when hovering a button.
+struct Tooltip(SharedString);
+
+impl Render for Tooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .font_family(".SystemUIFont")
+            .text_xs()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(CARD))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .text_color(rgb(TEXT))
+            .shadow_md()
+            .child(self.0.clone())
+    }
+}
+
+fn tooltip(text: &'static str) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
+    move |_, cx| cx.new(|_| Tooltip(text.into())).into()
 }
 
 #[derive(Clone)]
@@ -251,6 +281,16 @@ struct Results {
     legend_hover: Option<Category>,
     /// Folders that look like someone's home folder (`home_folders`).
     homes: Vec<usize>,
+    /// The Collector's items are being moved to the Trash.
+    trashing: bool,
+    /// The last move to the Trash, confirmed in the Collector until it changes again.
+    trashed: Option<Trashed>,
+}
+
+struct Trashed {
+    /// The item's name, or how many there were.
+    what: String,
+    frees: u64,
 }
 
 impl Results {
@@ -276,6 +316,8 @@ impl Results {
             categories: HashMap::new(),
             legend_hover: None,
             homes: Vec::new(),
+            trashing: false,
+            trashed: None,
         };
         results.homes = home_folders(&results.tree);
         results.relayout();
@@ -348,7 +390,7 @@ impl Results {
     }
 
     fn collect(&mut self, ix: usize) {
-        if ix == Tree::ROOT || self.tree.nodes[ix].parent.is_none() || self.tree.nodes[ix].kind == Kind::Other {
+        if self.trashing || ix == Tree::ROOT || self.tree.nodes[ix].parent.is_none() || self.tree.nodes[ix].kind == Kind::Other {
             return;
         }
         if self.collector.iter().any(|&c| self.tree.is_ancestor_or_self(c, ix)) {
@@ -364,8 +406,66 @@ impl Results {
         self.collector.iter().map(|&c| self.tree.nodes[c].size).sum()
     }
 
+    /// `ix`'s path as the user knows it: when scanning the startup disk the tree is rooted
+    /// at the Data volume, but `/Users/…` is what Finder and Terminal show.
+    fn shown_path(&self, ix: usize) -> PathBuf {
+        let path = self.tree.path_of(ix);
+        match path.strip_prefix(&self.tree.root_path) {
+            Ok(relative) if self.requested_root != self.tree.root_path => self.requested_root.join(relative),
+            _ => path,
+        }
+    }
+
+    fn collected_set(&self) -> HashSet<usize> {
+        self.collector.iter().copied().collect()
+    }
+
+    /// Whether every folder of each finding is in the Collector (itself or inside a
+    /// collected folder).
+    fn findings_collected(&self) -> Vec<bool> {
+        let set = self.collected_set();
+        self.findings
+            .iter()
+            .map(|f| f.fix == Fix::Trash && !f.nodes.is_empty() && f.nodes.iter().all(|&n| is_covered(&self.tree, &set, n)))
+            .collect()
+    }
+
+    /// After a move to the Trash: drop what went from the findings and refresh their sizes.
+    /// `touched` (worked out before the items were detached) says which findings held or
+    /// sat around a trashed item.
+    fn update_findings(&mut self, trashed: &HashSet<usize>, touched: &[bool]) {
+        let tree = &self.tree;
+        let mut touched = touched.iter();
+        self.findings.retain_mut(|f| {
+            if !touched.next().copied().unwrap_or(false) {
+                return true;
+            }
+            f.nodes.retain(|&n| !is_covered(tree, trashed, n));
+            f.size = match f.fix {
+                Fix::Trash => f.nodes.iter().map(|&n| tree.nodes[n].size).sum(),
+                Fix::GitGc => f.nodes.iter().map(|&n| findings::loose_objects_size(tree, n)).sum(),
+            };
+            f.pending = false;
+            f.size >= findings::MIN_SIZE
+        });
+        self.findings.sort_by(|a, b| b.size.cmp(&a.size));
+    }
 
 
+
+}
+
+/// Whether `ix` is one of `set` or inside one of them.
+fn is_covered(tree: &Tree, set: &HashSet<usize>, mut ix: usize) -> bool {
+    loop {
+        if set.contains(&ix) {
+            return true;
+        }
+        match tree.nodes[ix].parent {
+            Some(parent) => ix = parent,
+            None => return false,
+        }
+    }
 }
 
 /// What a node is. The APFS volume slices are the system's; the unscanned or unreadable
@@ -438,6 +538,10 @@ pub struct Petal {
     screen: Screen,
     focus_handle: FocusHandle,
     error: Option<String>,
+    /// A short confirmation at the bottom of the window; `notice_version` lets a newer
+    /// one outlive the timer of the one it replaced.
+    notice: Option<String>,
+    notice_version: u64,
     access: Access,
     _access_watch: Option<Task<()>>,
     /// Kept here rather than on the results, so a rescan keeps the user's choice.
@@ -456,6 +560,8 @@ impl Petal {
             screen: Screen::Start(scan::volumes()),
             focus_handle,
             error: None,
+            notice: None,
+            notice_version: 0,
             access,
             _access_watch: None,
             color_by: ColorBy::Folder,
@@ -745,6 +851,7 @@ impl Petal {
     /// Work out what the Collector frees, off the UI thread.
     fn collector_changed(&mut self, cx: &mut Context<Self>) {
         let Some(r) = self.results() else { return };
+        r.trashed = None;
         r.collector_version += 1;
         r.collector_frees.set(None);
         let version = r.collector_version;
@@ -838,6 +945,29 @@ impl Petal {
         cx.notify();
     }
 
+    fn show_notice(&mut self, text: String, cx: &mut Context<Self>) {
+        self.notice = Some(text);
+        self.notice_version += 1;
+        let version = self.notice_version;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(NOTICE_TIME).await;
+            this.update(cx, |this, cx| {
+                if this.notice_version == version {
+                    this.notice = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn copy_to_clipboard(&mut self, text: String, notice: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.show_notice(notice, cx);
+    }
+
     fn trash_collected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(r) = self.results() else { return };
         if r.collector.is_empty() {
@@ -859,6 +989,12 @@ impl Petal {
                 format_size(r.collected_size())
             ),
         };
+        let what = if items.len() == 1 {
+            format!("“{}”", r.tree.nodes[items[0]].name)
+        } else {
+            format!("{} items", format_count(items.len() as u64))
+        };
+        let frees = r.collector_frees.get().unwrap_or_else(|| r.collected_size());
         let answer = window.prompt(
             PromptLevel::Warning,
             &message,
@@ -870,26 +1006,55 @@ impl Petal {
             if answer.await != Ok(0) {
                 return;
             }
+            let started = this.update(cx, |this, cx| {
+                if let Some(r) = this.results() {
+                    r.trashing = true;
+                    cx.notify();
+                }
+            });
+            if started.is_err() {
+                return;
+            }
             let result = cx
                 .background_spawn(async move { trashing::move_to_trash(&paths) })
                 .await;
             this.update(cx, |this, cx| {
+                if let Some(r) = this.results() {
+                    r.trashing = false;
+                }
                 match result {
                     Ok(()) => {
                         if let Some(r) = this.results() {
+                            let set: HashSet<usize> = items.iter().copied().collect();
+                            // Before detaching: afterwards an item no longer knows its ancestors.
+                            let mut around = HashSet::new();
+                            for &t in &items {
+                                let mut at = r.tree.nodes[t].parent;
+                                while let Some(p) = at.filter(|&p| around.insert(p)) {
+                                    at = r.tree.nodes[p].parent;
+                                }
+                            }
+                            let touched: Vec<bool> = r
+                                .findings
+                                .iter()
+                                .map(|f| f.nodes.iter().any(|&n| around.contains(&n) || is_covered(&r.tree, &set, n)))
+                                .collect();
                             for &ix in &items {
                                 if r.tree.is_ancestor_or_self(ix, r.focus) {
                                     r.focus = r.tree.nodes[ix].parent.unwrap_or(Tree::ROOT);
                                 }
                                 r.tree.remove(ix);
                             }
+                            r.update_findings(&set, &touched);
                             r.collector.clear();
                             r.collector_frees.set(None);
+                            r.trashed = Some(Trashed { what, frees });
                             r.chart_hover = None;
                             r.list_hover = None;
                             r.anim_start = clock::now();
                             r.relayout();
                         }
+                        cx.play_haptic_feedback(HapticFeedbackStyle::LevelChange);
                     }
                     Err(error) => this.error = Some(format!("Couldn’t move to Trash: {error}")),
                 }
@@ -926,6 +1091,24 @@ impl Render for Petal {
             .text_sm()
             .child(self.render_toolbar(cx))
             .child(div().flex_1().min_h_0().flex().child(content))
+            .when_some(self.notice.clone().filter(|_| self.error.is_none()), |el, notice| {
+                el.child(
+                    div().absolute().bottom_4().left_0().right_0().flex().justify_center().child(
+                        div()
+                            .px_4()
+                            .py_2()
+                            .rounded_full()
+                            .bg(rgb(CARD))
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .shadow_lg()
+                            .flex()
+                            .gap_2()
+                            .child(div().text_color(rgb(SAFE)).font_weight(FontWeight::BOLD).child("✓"))
+                            .child(notice),
+                    ),
+                )
+            })
             .when_some(self.error.clone(), |el, error| {
                 el.child(
                     div()
@@ -1004,9 +1187,12 @@ impl Petal {
             .border_b_1()
             .border_color(rgb(BORDER))
             .bg(rgb(PANEL))
+            // The window owns its titlebar drag (`app_owns_titlebar_drag`), so this is the
+            // only handler: buttons stop the mouse-down, and a double-click on the bar itself
+            // does what System Settings says (zoom, minimize or nothing).
             .on_mouse_down(MouseButton::Left, |event, window, _| {
                 if event.click_count == 2 {
-                    window.zoom_window();
+                    window.titlebar_double_click();
                 } else {
                     window.start_window_move();
                 }
@@ -1015,11 +1201,16 @@ impl Petal {
         match &self.screen {
             Screen::Results(r) => {
                 let can_go_up = r.tree.nodes[r.focus].parent.is_some();
-                bar = bar.child(
+                // At the top there's nowhere to go: no hover, no pointer.
+                let up = if can_go_up {
                     button("up", "‹")
-                        .text_base()
+                } else {
+                    button_base("up", "‹").bg(rgb(CARD)).border_color(rgb(BORDER)).opacity(0.4).cursor_default()
+                };
+                bar = bar.child(
+                    up.text_base()
                         .px_2()
-                        .when(!can_go_up, |b| b.opacity(0.4))
+                        .tooltip(tooltip("Enclosing Folder (⌘↑)"))
                         .on_click(cx.listener(|this, _, window, cx| this.go_up(&GoUp, window, cx))),
                 );
                 let chain = r.tree.ancestry(r.focus);
@@ -1063,10 +1254,12 @@ impl Petal {
                     )
                     .child(
                         button("rescan", "Rescan")
+                            .tooltip(tooltip("Scan this folder again (⌘R)"))
                             .on_click(cx.listener(|this, _, window, cx| this.rescan(&Rescan, window, cx))),
                     )
                     .child(
                         button("start-over", "Disks")
+                            .tooltip(tooltip("Back to the list of disks (⇧⌘D)"))
                             .on_click(cx.listener(|this, _, window, cx| this.start_over(&StartOver, window, cx))),
                     );
             }
@@ -1321,7 +1514,7 @@ impl Petal {
                 (scanning.focus.is_empty())
                     .then(|| findings::early_findings(&progress.early_findings.lock().unwrap()))
                     .filter(|f| !f.is_empty()),
-                |d, early| d.child(self.render_findings(&early, false, cx)),
+                |d, early| d.child(self.render_findings(&early, false, &[], cx)),
             )
             .children(crumbs)
             .child(rows)
@@ -1556,17 +1749,38 @@ impl Petal {
                         format_size(focus.size),
                         format_count(focus.items)
                     )))
-                    .when(r.tree.cloud_only > 0, |d| {
-                        d.child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                            "{} cloud-only folders not downloaded (use no space here)",
-                            format_count(r.tree.cloud_only)
-                        )))
-                    })
-                    .when(r.tree.errors > 0, |d| {
-                        d.child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                            "{} items couldn’t be read (permissions)",
-                            format_count(r.tree.errors)
-                        )))
+                    // Counts for the whole scan, so only at its top, in one line; the
+                    // tooltips explain them.
+                    .when(r.focus == Tree::ROOT && (r.tree.cloud_only > 0 || r.tree.errors > 0), |d| {
+                        let unreadable_reason = if self.access == Access::Missing {
+                            "Private to macOS until Petal has Full Disk Access"
+                        } else {
+                            "Protected by macOS or owned by another user; not even Full Disk Access opens them"
+                        };
+                        d.child(
+                            div()
+                                .flex()
+                                .gap_1()
+                                .text_xs()
+                                .text_color(rgb(MUTED))
+                                .when(r.tree.cloud_only > 0, |d| {
+                                    d.child(
+                                        div()
+                                            .id("cloud-only")
+                                            .tooltip(tooltip("In iCloud and not downloaded, so they use no space on this Mac"))
+                                            .child(format!("{} cloud-only", format_count(r.tree.cloud_only))),
+                                    )
+                                })
+                                .when(r.tree.cloud_only > 0 && r.tree.errors > 0, |d| d.child("·"))
+                                .when(r.tree.errors > 0, |d| {
+                                    d.child(
+                                        div()
+                                            .id("unreadable")
+                                            .tooltip(tooltip(unreadable_reason))
+                                            .child(format!("{} unreadable", format_count(r.tree.errors))),
+                                    )
+                                }),
+                        )
                     }),
             )
             .children((r.focus == Tree::ROOT).then(|| {
@@ -1577,7 +1791,9 @@ impl Petal {
                     .map(|&c| r.tree.nodes[c].size);
                 self.render_access_card(not_readable, cx)
             }).flatten())
-            .when(r.focus == Tree::ROOT && !r.findings.is_empty(), |d| d.child(self.render_findings(&r.findings, true, cx)))
+            .when(r.focus == Tree::ROOT && !r.findings.is_empty(), |d| {
+                d.child(self.render_findings(&r.findings, true, &r.findings_collected(), cx))
+            })
             .child(
                 div().flex_1().min_h_0().px_2().child(
                     uniform_list("children", count, cx.processor(Self::render_rows))
@@ -1589,17 +1805,26 @@ impl Petal {
     }
 
     /// Known space hogs with exact sizes. `interactive` (results only): click to open the
-    /// folder, + to collect it.
-    fn render_findings(&self, findings: &[Finding], interactive: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    /// folder, + to collect it. `collected[i]`: finding `i` is already in the Collector.
+    fn render_findings(
+        &self,
+        findings: &[Finding],
+        interactive: bool,
+        collected: &[bool],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let safe: u64 = findings.iter().filter(|f| f.safety == Safety::Safe).map(|f| f.size).sum();
         let mut list = div().id("findings").max_h(px(250.)).overflow_y_scroll().flex().flex_col().gap_0p5();
         for (i, finding) in findings.iter().enumerate() {
             let (tag, color) = match finding.safety {
-                Safety::Safe => ("Safe to delete", 0x3fb950),
+                Safety::Safe => ("Safe to delete", SAFE),
                 Safety::Review => ("Review first", 0xd29922),
             };
             let target = finding.nodes.first().copied().filter(|_| finding.path.is_some());
             let nodes = finding.nodes.clone();
+            let uncollect = finding.nodes.clone();
+            let in_collector = collected.get(i).copied().unwrap_or(false);
+            let fix = finding.fix;
             list = list.child(
                 div()
                     .id(("finding", i))
@@ -1609,6 +1834,7 @@ impl Petal {
                     .rounded_md()
                     .flex()
                     .flex_col()
+                    .when(in_collector, |d| d.bg(rgba(ACCENT_TINT)))
                     .when(interactive && target.is_some(), |d| {
                         d.cursor_pointer().hover(|s| s.bg(rgb(CARD_HOVER))).on_click(cx.listener(move |this, _, _, cx| {
                             if let (Some(r), Some(ix)) = (this.results(), target) {
@@ -1633,7 +1859,25 @@ impl Petal {
                                     .when(finding.pending, |d| d.text_color(rgb(MUTED)))
                                     .child(if finding.pending { "…".to_string() } else { format_size(finding.size) }),
                             )
-                            .when(interactive, |d| {
+                            .when(interactive && fix == Fix::GitGc, |d| {
+                                let git_dirs = nodes.clone();
+                                d.child(
+                                    icon_button(("copy-gc", i), "⧉", "Copy git gc Commands")
+                                        .invisible()
+                                        .group_hover("finding", |s| s.visible())
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            let Some(r) = this.results() else { return };
+                                            let paths: Vec<PathBuf> = git_dirs.iter().map(|&ix| r.shown_path(ix)).collect();
+                                            let notice = match paths.len() {
+                                                1 => "Copied the git gc command: paste it in Terminal".to_string(),
+                                                n => format!("Copied git gc commands for {n} repositories: paste them in Terminal"),
+                                            };
+                                            this.copy_to_clipboard(findings::git_gc_commands(&paths), notice, cx);
+                                        })),
+                                )
+                            })
+                            .when(interactive && fix == Fix::Trash && !in_collector, |d| {
                                 d.child(
                                     icon_button(("collect-finding", i), "+", "Add to Collector")
                                         .invisible()
@@ -1649,6 +1893,20 @@ impl Petal {
                                             cx.notify();
                                         })),
                                 )
+                            })
+                            .when(interactive && in_collector, |d| {
+                                d.child(
+                                    icon_button(("uncollect-finding", i), "✓", "Remove from Collector")
+                                        .text_color(rgb(ACCENT))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            if let Some(r) = this.results().filter(|r| !r.trashing) {
+                                                r.collector.retain(|c| !uncollect.contains(c));
+                                            }
+                                            this.collector_changed(cx);
+                                            cx.notify();
+                                        })),
+                                )
                             }),
                     )
                     .child(
@@ -1659,7 +1917,11 @@ impl Petal {
                             .text_xs()
                             .child(div().flex_none().text_color(rgb(color)).child(tag))
                             .child(div().flex_none().text_color(rgb(MUTED)).child("·"))
-                            .child(div().min_w_0().text_color(rgb(MUTED)).truncate().child(finding.blurb.clone())),
+                            .child(if in_collector {
+                                div().min_w_0().text_color(rgb(ACCENT)).truncate().child("In Collector")
+                            } else {
+                                div().min_w_0().text_color(rgb(MUTED)).truncate().child(finding.blurb.clone())
+                            }),
                     ),
             );
         }
@@ -1695,6 +1957,7 @@ impl Petal {
         let Screen::Results(r) = &self.screen else { return Vec::new() };
         let focus = &r.tree.nodes[r.focus];
         let hovered = r.hovered();
+        let collected = r.collected_set();
         range
             .filter_map(|i| focus.children.get(i).copied())
             .map(|ix| {
@@ -1705,6 +1968,8 @@ impl Petal {
                 let is_dir = node.kind == Kind::Dir;
                 let dragged = DraggedItem { node: ix, name: node.name.clone(), size: node.size };
                 let path = r.tree.path_of(ix);
+                let shown_path = r.shown_path(ix).to_string_lossy().into_owned();
+                let in_collector = is_covered(&r.tree, &collected, ix);
 
                 div()
                     .id(("row", ix))
@@ -1760,16 +2025,39 @@ impl Petal {
                                 },
                             )),
                         )
-                        .child(icon_button(("collect", ix), "+", "Add to Collector").on_click(cx.listener(
+                        .child(icon_button(("copy-path", ix), "⧉", "Copy Path").on_click(cx.listener(
                             move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                if let Some(r) = this.results() {
-                                    r.collect(ix);
-                                }
-                                this.collector_changed(cx);
-                                cx.notify();
+                                let notice = format!("Copied {}", abbreviate_home(&shown_path));
+                                this.copy_to_clipboard(shown_path.clone(), notice, cx);
                             },
                         )))
+                        .when(!in_collector, |d| {
+                            d.child(icon_button(("collect", ix), "+", "Add to Collector").on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(r) = this.results() {
+                                        r.collect(ix);
+                                    }
+                                    this.collector_changed(cx);
+                                    cx.notify();
+                                },
+                            )))
+                        })
+                    })
+                    .when(in_collector, |d| {
+                        d.child(
+                            icon_button(("uncollect-row", ix), "✓", "Remove from Collector")
+                                .text_color(rgb(ACCENT))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(r) = this.results().filter(|r| !r.trashing) {
+                                        r.collector.retain(|&c| c != ix);
+                                    }
+                                    this.collector_changed(cx);
+                                    cx.notify();
+                                })),
+                        )
                     })
                     .child(
                         div()
@@ -1791,14 +2079,25 @@ impl Petal {
 
     fn render_collector(&self, r: &Results, cx: &mut Context<Self>) -> impl IntoElement {
         let empty = r.collector.is_empty();
-        // A dozen chips is plenty; collecting e.g. every node_modules adds hundreds.
+        let busy = r.trashing;
+        // One chip per name: collecting every node_modules shouldn't make hundreds of
+        // identical chips.
+        let mut groups: Vec<(SharedString, Vec<usize>)> = Vec::new();
+        for &ix in &r.collector {
+            let name = &r.tree.nodes[ix].name;
+            match groups.iter_mut().find(|(n, _)| n == name) {
+                Some((_, members)) => members.push(ix),
+                None => groups.push((name.clone(), vec![ix])),
+            }
+        }
         const MAX_CHIPS: usize = 12;
-        let mut chips = div().flex().flex_wrap().gap_1();
-        for &ix in r.collector.iter().take(MAX_CHIPS) {
-            let node = &r.tree.nodes[ix];
+        let mut chips = div().flex().flex_wrap().gap_1().when(busy, |d| d.opacity(0.5));
+        for (name, members) in groups.iter().take(MAX_CHIPS) {
+            let count = members.len();
+            let members = members.clone();
             chips = chips.child(
                 div()
-                    .id(("chip", ix))
+                    .id(("chip", members[0]))
                     .flex()
                     .items_center()
                     .gap_1()
@@ -1809,27 +2108,30 @@ impl Petal {
                     .bg(rgb(CARD_HOVER))
                     .text_xs()
                     .max_w(px(300.))
-                    .child(div().truncate().child(node.name.clone()))
-                    .child(
-                        div()
-                            .id(("uncollect", ix))
-                            .px_1()
-                            .rounded_full()
-                            .cursor_pointer()
-                            .text_color(rgb(MUTED))
-                            .hover(|s| s.text_color(rgb(TEXT)))
-                            .child("×")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(r) = this.results() {
-                                    r.collector.retain(|&c| c != ix);
-                                }
-                                this.collector_changed(cx);
-                                cx.notify();
-                            })),
-                    ),
+                    .child(div().truncate().child(name.clone()))
+                    .when(count > 1, |d| d.child(div().flex_none().text_color(rgb(MUTED)).child(format!("×{}", format_count(count as u64)))))
+                    .when(!busy, |d| {
+                        d.child(
+                            div()
+                                .id(("uncollect", members[0]))
+                                .px_1()
+                                .rounded_full()
+                                .cursor_pointer()
+                                .text_color(rgb(MUTED))
+                                .hover(|s| s.text_color(rgb(TEXT)))
+                                .child("×")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(r) = this.results() {
+                                        r.collector.retain(|c| !members.contains(c));
+                                    }
+                                    this.collector_changed(cx);
+                                    cx.notify();
+                                })),
+                        )
+                    }),
             );
         }
-        if r.collector.len() > MAX_CHIPS {
+        if groups.len() > MAX_CHIPS {
             chips = chips.child(
                 div()
                     .px_2()
@@ -1837,14 +2139,18 @@ impl Petal {
                     .rounded_full()
                     .text_xs()
                     .text_color(rgb(MUTED))
-                    .child(format!("+{} more", r.collector.len() - MAX_CHIPS)),
+                    .child(format!("+{} more", groups.len() - MAX_CHIPS)),
             );
         }
         let size = r.collected_size();
         let frees = r.collector_frees.get();
-        let shared_note = frees.filter(|&f| size > f + size / 100).map(|f| {
+        let shared_note = frees.filter(|&f| !busy && size > f + size / 100).map(|f| {
             format!("{} is shared with files outside the selection (APFS clones or hard links), so deleting won't free it", format_size(size - f))
         });
+        let items = match r.collector.len() {
+            1 => "1 item".to_string(),
+            n => format!("{} items", format_count(n as u64)),
+        };
 
         div()
             .id("collector")
@@ -1852,7 +2158,7 @@ impl Petal {
             .p_3()
             .rounded_lg()
             .border_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(if r.trashed.is_some() && empty { SAFE } else { BORDER }))
             .bg(rgb(BG))
             .flex()
             .flex_col()
@@ -1872,19 +2178,37 @@ impl Petal {
                     .child(div().font_weight(FontWeight::SEMIBOLD).child("Collector"))
                     .when(!empty, |d| {
                         d.child(div().text_color(rgb(MUTED)).child(match frees {
-                            Some(frees) => format!("{} · frees {}", r.collector.len(), format_size(frees)),
-                            None => format!("{} · calculating…", r.collector.len()),
+                            Some(frees) => format!("{items} · frees {}", format_size(frees)),
+                            None => format!("{items} · calculating…"),
                         }))
                     }),
             )
             .when_some(shared_note, |d, note| d.child(div().text_xs().text_color(rgb(MUTED)).child(note)))
-            .when(empty, |d| {
-                d.child(
+            .when(empty, |d| match &r.trashed {
+                Some(trashed) => d.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .flex()
+                                .gap_1()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(div().text_color(rgb(SAFE)).font_weight(FontWeight::BOLD).child("✓"))
+                                .child(format!("Moved {} to the Trash", trashed.what)),
+                        )
+                        .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
+                            "Freed {}. You can put items back from the Trash in Finder.",
+                            format_size(trashed.frees)
+                        ))),
+                ),
+                None => d.child(
                     div()
                         .text_xs()
                         .text_color(rgb(MUTED))
                         .child("Drag items here (or press + on a row) to collect them for deletion."),
-                )
+                ),
             })
             .when(!empty, |d| {
                 d.child(chips).child(
@@ -1892,17 +2216,27 @@ impl Petal {
                         .flex()
                         .gap_2()
                         .justify_end()
-                        .child(button("clear-collector", "Clear").on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(r) = this.results() {
-                                r.collector.clear();
-                            }
-                            this.collector_changed(cx);
-                            cx.notify();
-                        })))
-                        .child(
-                            primary_button("trash", "Move to Trash…", DANGER)
-                                .on_click(cx.listener(|this, _, window, cx| this.trash_collected(window, cx))),
-                        ),
+                        .items_center()
+                        .when(busy, |d| {
+                            d.child(
+                                primary_button("trash", "Moving to Trash…", DANGER)
+                                    .opacity(0.6)
+                                    .cursor_default(),
+                            )
+                        })
+                        .when(!busy, |d| {
+                            d.child(button("clear-collector", "Clear").on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(r) = this.results() {
+                                    r.collector.clear();
+                                }
+                                this.collector_changed(cx);
+                                cx.notify();
+                            })))
+                            .child(
+                                primary_button("trash", "Move to Trash…", DANGER)
+                                    .on_click(cx.listener(|this, _, window, cx| this.trash_collected(window, cx))),
+                            )
+                        }),
                 )
             })
     }
@@ -2189,9 +2523,10 @@ fn render_legend(r: &Results, cx: &mut Context<Petal>) -> impl IntoElement {
     legend
 }
 
-fn icon_button(id: impl Into<gpui::ElementId>, glyph: &'static str, _tooltip: &'static str) -> Stateful<gpui::Div> {
+fn icon_button(id: impl Into<gpui::ElementId>, glyph: &'static str, label: &'static str) -> Stateful<gpui::Div> {
     div()
         .id(id)
+        .tooltip(tooltip(label))
         .size(px(20.))
         .flex_none()
         .flex()

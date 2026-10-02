@@ -58,6 +58,16 @@ pub const CATALOG: &[Category] = &[
 /// Findings smaller than this aren't worth anyone's attention.
 pub const MIN_SIZE: u64 = 50_000_000;
 
+/// What to do about a finding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fix {
+    /// Collect its folders and move them to the Trash.
+    Trash,
+    /// Run `git gc` in each repository. Its folders are `.git` folders, which must never
+    /// be collected: that would throw away the repository's history.
+    GitGc,
+}
+
 #[derive(Clone, Debug)]
 pub struct Finding {
     pub title: &'static str,
@@ -71,6 +81,7 @@ pub struct Finding {
     /// `size` is still the allocated size; what deleting frees is being worked out in
     /// the background (`scan::frees_of`).
     pub pending: bool,
+    pub fix: Fix,
 }
 
 /// A hotspot's result as reported mid-scan.
@@ -97,6 +108,7 @@ pub fn early_findings(early: &[Early]) -> Vec<Finding> {
                 path: Some(e.path.clone()),
                 nodes: Vec::new(),
                 pending: false,
+                fix: Fix::Trash,
             }
         })
         .collect();
@@ -104,7 +116,8 @@ pub fn early_findings(early: &[Early]) -> Vec<Finding> {
     findings
 }
 
-/// Findings from a finished scan: the catalog locations, plus every `node_modules`.
+/// Findings from a finished scan: the catalog locations, plus every `node_modules` and
+/// every Git repository with a lot of loose objects.
 /// Sizes start as allocated size, all `pending`: what deleting really frees depends on
 /// APFS clone sharing, which the caller works out in the background (`scan::frees_of`).
 pub fn from_tree(tree: &Tree, bases: &Bases) -> Vec<Finding> {
@@ -127,13 +140,15 @@ fn from_tree_min(tree: &Tree, bases: &Bases, min_size: u64) -> Vec<Finding> {
                     path: Some(path),
                     nodes: vec![ix],
                     pending: true,
+                    fix: Fix::Trash,
                 });
             }
         }
     }
 
-    // node_modules anywhere, counting nested ones once.
+    // node_modules anywhere, counting nested ones once; and Git repositories.
     let mut modules = Vec::new();
+    let mut repos = Vec::new();
     let mut stack = vec![Tree::ROOT];
     while let Some(ix) = stack.pop() {
         for &child in &tree.nodes[ix].children {
@@ -141,10 +156,15 @@ fn from_tree_min(tree: &Tree, bases: &Bases, min_size: u64) -> Vec<Finding> {
             if node.kind != Kind::Dir {
                 continue;
             }
-            if node.name.as_ref() == "node_modules" {
-                modules.push(child);
-            } else {
-                stack.push(child);
+            match node.name.as_ref() {
+                "node_modules" => modules.push(child),
+                ".git" => {
+                    let loose = loose_objects_size(tree, child);
+                    if loose > 0 && loose >= min_size / 10 {
+                        repos.push((child, loose));
+                    }
+                }
+                _ => stack.push(child),
             }
         }
     }
@@ -160,11 +180,62 @@ fn from_tree_min(tree: &Tree, bases: &Bases, min_size: u64) -> Vec<Finding> {
             path: None,
             nodes: modules,
             pending: true,
+            fix: Fix::Trash,
+        });
+    }
+
+    // Each `git add` of a changed file stores a whole new compressed copy as a loose
+    // object, and Git only packs them (or drops the unused ones) once there are thousands
+    // of them, so repositories of big data files can grow by tens of GB.
+    repos.sort_by(|a, b| b.1.cmp(&a.1));
+    let size: u64 = repos.iter().map(|&(_, loose)| loose).sum();
+    if !repos.is_empty() && size >= min_size {
+        let count = repos.len();
+        findings.push(Finding {
+            title: "Unpacked Git data",
+            blurb: format!(
+                "In {count} {}; `git gc` packs it",
+                if count == 1 { "repo" } else { "repos" }
+            ),
+            safety: Safety::Review,
+            size,
+            path: Some(tree.path_of(repos[0].0)),
+            nodes: repos.into_iter().map(|(ix, _)| ix).collect(),
+            pending: false,
+            fix: Fix::GitGc,
         });
     }
 
     findings.sort_by(|a, b| b.size.cmp(&a.size));
     findings
+}
+
+/// How much of a `.git` folder is loose objects (`objects/00` to `objects/ff`): each one
+/// compressed on its own, unlike the packs `git gc` makes.
+pub fn loose_objects_size(tree: &Tree, git: usize) -> u64 {
+    let Some(&objects) = tree.nodes[git].children.iter().find(|&&c| tree.nodes[c].name.as_ref() == "objects") else {
+        return 0;
+    };
+    tree.nodes[objects]
+        .children
+        .iter()
+        .filter(|&&c| {
+            let name = tree.nodes[c].name.as_bytes();
+            name.len() == 2 && name.iter().all(u8::is_ascii_hexdigit)
+        })
+        .map(|&c| tree.nodes[c].size)
+        .sum()
+}
+
+/// Shell commands that run `git gc` in the repositories of these `.git` folders, one
+/// per line.
+pub fn git_gc_commands(git_dirs: &[PathBuf]) -> String {
+    git_dirs
+        .iter()
+        .filter_map(|git| git.parent())
+        .map(|repo| format!("git -C '{}' gc", repo.to_string_lossy().replace('\'', r"'\''")))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Where the catalog's base folders are, as paths inside a scanned tree.
@@ -251,5 +322,32 @@ mod tests {
         // Largest first.
         assert!(findings.windows(2).all(|w| w[0].size >= w[1].size));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn finds_loose_git_objects_but_not_packs() {
+        let dir = std::env::temp_dir().join(format!("petal-git-findings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write(&dir.join("big/.git/objects/3a/1111"), 400_000);
+        write(&dir.join("big/.git/objects/f0/2222"), 300_000);
+        write(&dir.join("big/.git/objects/pack/pack-1.pack"), 900_000);
+        write(&dir.join("packed/.git/objects/pack/pack-2.pack"), 900_000);
+        write(&dir.join("small/.git/objects/ab/3333"), 100_000);
+
+        let tree = scan(&dir, &Progress::default());
+        let findings = from_tree_min(&tree, &Bases::default(), 0);
+        let git = findings.iter().find(|f| f.fix == Fix::GitGc).expect("git finding");
+        let big = tree.find(&dir.join("big/.git")).unwrap();
+        let small = tree.find(&dir.join("small/.git")).unwrap();
+        assert_eq!(git.nodes, vec![big, small], "largest first, packed repository left out");
+        assert_eq!(git.size, loose_objects_size(&tree, big) + loose_objects_size(&tree, small));
+        assert!(loose_objects_size(&tree, big) < tree.nodes[big].size, "packs don't count");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn git_gc_commands_quote_paths() {
+        let dirs = [PathBuf::from("/a/repo/.git"), PathBuf::from("/b/it's here/.git")];
+        assert_eq!(git_gc_commands(&dirs), "git -C '/a/repo' gc\ngit -C '/b/it'\\''s here' gc");
     }
 }
