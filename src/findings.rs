@@ -196,7 +196,9 @@ fn from_tree_min(tree: &Tree, bases: &Bases, min_size: u64) -> Vec<Finding> {
     let off_limits = |path: &Path| bases.protected.iter().any(|p| path.starts_with(p));
     let mut modules = Vec::new();
     let mut repos = Vec::new();
-    let root_excluded = tree.root_path.components().any(|c| not_a_project_area(&c.as_os_str().to_string_lossy()))
+    // Where the scan really is: it may have started from a symlink (into an app, say).
+    let real_root = std::fs::canonicalize(&tree.root_path).unwrap_or_else(|_| tree.root_path.clone());
+    let root_excluded = real_root.components().any(|c| not_a_project_area(&c.as_os_str().to_string_lossy()))
         || off_limits(&tree.root_path);
     let mut stack = if root_excluded { Vec::new() } else { vec![Tree::ROOT] };
     while let Some(ix) = stack.pop() {
@@ -347,6 +349,10 @@ impl Bases {
     /// The real locations, as they appear under `tree_root`: as-is, or under the Data
     /// volume when scanning the startup disk.
     pub fn for_root(tree_root: &Path) -> Self {
+        Self::for_root_with_home(tree_root, std::env::var_os("HOME").map(PathBuf::from))
+    }
+
+    fn for_root_with_home(tree_root: &Path, home: Option<PathBuf>) -> Self {
         let within = |path: PathBuf| -> Option<PathBuf> {
             if path.starts_with(tree_root) {
                 return Some(path);
@@ -354,7 +360,6 @@ impl Bases {
             let mapped = tree_root.join(path.strip_prefix("/").ok()?);
             mapped.exists().then_some(mapped)
         };
-        let home = std::env::var_os("HOME").map(PathBuf::from);
         let protected = PROTECTED
             .iter()
             .map(PathBuf::from)
@@ -377,11 +382,14 @@ impl Bases {
 /// scan is inside it (e.g. a scan of ~/Library/Application Support), else wherever `within`
 /// finds it. The startup disk's Data volume counts as `/`, not as part of /System.
 fn protected_in_tree(tree_root: &Path, path: PathBuf, within: impl Fn(PathBuf) -> Option<PathBuf>) -> Option<PathBuf> {
-    let as_shown = match tree_root.strip_prefix(DATA_VOLUME) {
+    // Compare where both really are: a scan can start from a symlink to ~/Library, say.
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let real_root = real(tree_root);
+    let as_shown = match real_root.strip_prefix(DATA_VOLUME) {
         Ok(rest) => Path::new("/").join(rest),
-        Err(_) => tree_root.to_path_buf(),
+        Err(_) => real_root,
     };
-    if as_shown.starts_with(&path) { Some(tree_root.to_path_buf()) } else { within(path) }
+    if as_shown.starts_with(real(&path)) { Some(tree_root.to_path_buf()) } else { within(path) }
 }
 
 /// e.g. /private/var/folders/xy/abc123…0000gn: the parent of DARWIN_USER_DIR.
@@ -573,6 +581,37 @@ mod tests {
         let mapped = |p: PathBuf| Some(data.join(p.strip_prefix("/").unwrap()));
         assert_eq!(protected_in_tree(data, "/Library".into(), mapped), Some(data.join("Library")));
         assert_eq!(protected_in_tree(&data.join("Library/Caches"), "/Library".into(), none), Some(data.join("Library/Caches")));
+    }
+
+    #[test]
+    fn scans_through_symlinks_into_protected_folders_find_no_node_modules() {
+        let dir = std::env::temp_dir().join(format!("petal-symlink-roots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        let tool = home.join("Library/Application Support/Tool");
+        let project = home.join("code/app");
+        for folder in [&tool, &project] {
+            write(&folder.join("package.json"), 100);
+            write(&folder.join("package-lock.json"), 100);
+            write(&folder.join("node_modules/a/index.js"), 90_000);
+        }
+        let link = |name: &str, target: &Path| {
+            std::os::unix::fs::symlink(target, dir.join(name)).unwrap();
+            dir.join(name)
+        };
+        let to_library = link("library-link", &home.join("Library"));
+        let to_tool_parent = link("support-link", &home.join("Library/Application Support"));
+        let to_project_parent = link("code-link", &home.join("code"));
+
+        let node_modules = |root: &Path| {
+            let tree = scan(root, &Progress::default());
+            let bases = Bases::for_root_with_home(root, Some(home.clone()));
+            from_tree_min(&tree, &bases, 0).into_iter().any(|f| f.fix == Fix::Trash && f.title == "node_modules")
+        };
+        assert!(!node_modules(&to_library), "a symlink to ~/Library is still ~/Library");
+        assert!(!node_modules(&to_tool_parent), "nor is a symlink to a folder inside it");
+        assert!(node_modules(&to_project_parent), "a symlink to a projects folder still finds them");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
