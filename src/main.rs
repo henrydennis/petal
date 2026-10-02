@@ -24,7 +24,7 @@ use gpui::{
 
 use app::{GoUp, OpenFolder, Petal, Rescan, StartOver};
 
-actions!(petal, [Quit]);
+actions!(petal, [Quit, Hide, HideOthers, ShowAll, Minimize, Zoom, CloseWindow]);
 
 fn main() {
     let _ = app::LAUNCHED.set(std::time::Instant::now());
@@ -54,8 +54,18 @@ fn main() {
 
     gpui_platform::application().run(move |cx: &mut App| {
         cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.on_action(|_: &Hide, cx| cx.hide());
+        cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
+        cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+        cx.on_action(|_: &Minimize, cx| with_window(cx, |window| window.minimize_window()));
+        cx.on_action(|_: &Zoom, cx| with_window(cx, |window| window.zoom_window()));
+        cx.on_action(|_: &CloseWindow, cx| with_window(cx, |window| window.remove_window()));
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-h", Hide, None),
+            KeyBinding::new("alt-cmd-h", HideOthers, None),
+            KeyBinding::new("cmd-m", Minimize, None),
+            KeyBinding::new("cmd-w", CloseWindow, None),
             KeyBinding::new("cmd-o", OpenFolder, None),
             KeyBinding::new("cmd-r", Rescan, None),
             KeyBinding::new("cmd-up", GoUp, None),
@@ -66,7 +76,13 @@ fn main() {
         cx.set_menus(vec![
             Menu {
                 name: "Petal".into(),
-                items: vec![MenuItem::action("Quit Petal", Quit)],
+                items: vec![
+                    MenuItem::action("Hide Petal", Hide),
+                    MenuItem::action("Hide Others", HideOthers),
+                    MenuItem::action("Show All", ShowAll),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit Petal", Quit),
+                ],
                 disabled: false,
             },
             Menu {
@@ -76,12 +92,19 @@ fn main() {
                     MenuItem::action("Rescan", Rescan),
                     MenuItem::separator(),
                     MenuItem::action("Show Disks", StartOver),
+                    MenuItem::separator(),
+                    MenuItem::action("Close Window", CloseWindow),
                 ],
                 disabled: false,
             },
             Menu {
                 name: "Go".into(),
                 items: vec![MenuItem::action("Enclosing Folder", GoUp)],
+                disabled: false,
+            },
+            Menu {
+                name: "Window".into(),
+                items: vec![MenuItem::action("Minimize", Minimize), MenuItem::action("Zoom", Zoom)],
                 disabled: false,
             },
         ]);
@@ -96,6 +119,10 @@ fn main() {
                     traffic_light_position: Some(point(px(16.), px(16.))),
                 }),
                 window_min_size: Some(size(px(860.), px(560.))),
+                // Petal draws its own toolbar in the titlebar and handles dragging and
+                // double-clicks there itself; otherwise macOS also acts on double-clicks
+                // on the toolbar's buttons (minimizing the window, say).
+                app_owns_titlebar_drag: true,
                 ..Default::default()
             },
             |window, cx| cx.new(|cx| Petal::new(initial, window, cx)),
@@ -110,4 +137,11 @@ fn main() {
         .detach();
         cx.activate(true);
     });
+}
+
+/// Run `f` on the frontmost window, if Petal has one.
+fn with_window(cx: &mut App, f: impl FnOnce(&mut gpui::Window)) {
+    if let Some(window) = cx.active_window() {
+        window.update(cx, |_, window, _| f(window)).ok();
+    }
 }
