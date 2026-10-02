@@ -1,0 +1,13 @@
+{
+  "name": "petal",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Release notes and version bumps for Petal (a Rust app) with changesets; Cargo.toml follows this version.",
+  "scripts": {
+    "changeset": "changeset",
+    "version": "changeset version && node scripts/sync-version.mjs"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^3.0.3"
+  }
+}
