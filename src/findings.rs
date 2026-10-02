@@ -116,8 +116,8 @@ pub fn early_findings(early: &[Early]) -> Vec<Finding> {
     findings
 }
 
-/// Findings from a finished scan: the catalog locations, plus every `node_modules` and
-/// every Git repository with a lot of loose objects.
+/// Findings from a finished scan: the catalog locations, plus the `node_modules` of every
+/// project and every Git repository with a lot of loose objects.
 /// Sizes start as allocated size, all `pending`: what deleting really frees depends on
 /// APFS clone sharing, which the caller works out in the background (`scan::frees_of`).
 pub fn from_tree(tree: &Tree, bases: &Bases) -> Vec<Finding> {
@@ -146,25 +146,40 @@ fn from_tree_min(tree: &Tree, bases: &Bases, min_size: u64) -> Vec<Finding> {
         }
     }
 
-    // node_modules anywhere, counting nested ones once; and Git repositories.
+    // Projects' node_modules, counting nested ones once; and Git repositories. Apps and
+    // tools keep node_modules too (Electron apps in their bundles, editors' extensions
+    // and CLIs under ~/Library and dot-folders); deleting those breaks them, and no
+    // package manager puts them back, so the walk stays out of all of those, and out of
+    // where apps and the system live.
+    let home_library = bases.home.as_ref().map(|home| home.join("Library"));
+    let off_limits = |path: &Path| {
+        bases.protected.iter().any(|p| path.starts_with(p)) || home_library.as_deref() == Some(path)
+    };
     let mut modules = Vec::new();
     let mut repos = Vec::new();
-    let mut stack = vec![Tree::ROOT];
+    let in_bundle = tree.root_path.components().any(|c| is_bundle(&c.as_os_str().to_string_lossy()));
+    let mut stack = if in_bundle || off_limits(&tree.root_path) { Vec::new() } else { vec![Tree::ROOT] };
     while let Some(ix) = stack.pop() {
         for &child in &tree.nodes[ix].children {
             let node = &tree.nodes[child];
             if node.kind != Kind::Dir {
                 continue;
             }
-            match node.name.as_ref() {
-                "node_modules" => modules.push(child),
-                ".git" => {
-                    let loose = loose_objects_size(tree, child);
-                    if loose > 0 && loose >= min_size / 10 {
-                        repos.push((child, loose));
-                    }
+            let name = node.name.as_ref();
+            if name == ".git" {
+                let loose = loose_objects_size(tree, child);
+                if loose > 0 && loose >= min_size / 10 {
+                    repos.push((child, loose));
                 }
-                _ => stack.push(child),
+            } else if name == "node_modules" {
+                if is_project(tree, ix) {
+                    modules.push(child);
+                }
+            } else if !(name.starts_with('.')
+                || is_bundle(name)
+                || (matches!(name, "Applications" | "System" | "Library") && off_limits(&tree.path_of(child))))
+            {
+                stack.push(child);
             }
         }
     }
@@ -210,6 +225,50 @@ fn from_tree_min(tree: &Tree, bases: &Bases, min_size: u64) -> Vec<Finding> {
     findings
 }
 
+/// Lockfiles: with one next to `package.json`, reinstalling brings back exactly the same
+/// `node_modules`.
+const LOCKFILES: &[&str] =
+    &["package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb"];
+
+/// Whether folder `ix` is a JavaScript project of the user's whose `node_modules` a
+/// package manager can reinstall: it has a `package.json` and a lockfile, and the user
+/// owns it (not an app's or another user's).
+fn is_project(tree: &Tree, ix: usize) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let has = |names: &[&str]| {
+        tree.nodes[ix].children.iter().any(|&c| tree.nodes[c].kind == Kind::File && names.contains(&tree.nodes[c].name.as_ref()))
+    };
+    has(&["package.json"])
+        && has(LOCKFILES)
+        && std::fs::metadata(tree.path_of(ix)).is_ok_and(|m| m.uid() == unsafe { libc::getuid() })
+}
+
+/// Folder extensions of macOS bundles: apps, plug-ins, frameworks… Their contents are
+/// sealed by the code signature, so removing anything inside breaks them.
+const BUNDLE_EXTENSIONS: &[&str] = &[
+    "app", "appex", "bundle", "framework", "plugin", "xpc", "kext", "systemextension", "prefpane", "qlgenerator",
+    "mdimporter", "saver", "driver",
+];
+
+pub fn is_bundle(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| BUNDLE_EXTENSIONS.iter().any(|b| b.eq_ignore_ascii_case(e)))
+}
+
+/// Whether `ix` is inside a bundle (not the bundle itself, which is fine to trash whole).
+pub fn is_inside_bundle(tree: &Tree, ix: usize) -> bool {
+    let mut at = tree.nodes[ix].parent;
+    while let Some(parent) = at {
+        if is_bundle(&tree.nodes[parent].name) {
+            return true;
+        }
+        at = tree.nodes[parent].parent;
+    }
+    false
+}
+
 /// How much of a `.git` folder is loose objects (`objects/00` to `objects/ff`): each one
 /// compressed on its own, unlike the packs `git gc` makes.
 pub fn loose_objects_size(tree: &Tree, git: usize) -> u64 {
@@ -243,7 +302,12 @@ pub fn git_gc_commands(git_dirs: &[PathBuf]) -> String {
 pub struct Bases {
     pub home: Option<PathBuf>,
     pub user_temp: Option<PathBuf>,
+    /// Where apps and the system live; nothing under them is ever a finding.
+    pub protected: Vec<PathBuf>,
 }
+
+/// Apps and the system: never searched for node_modules or anything else to delete.
+const PROTECTED: &[&str] = &["/Applications", "/System", "/Library"];
 
 impl Bases {
     /// The real locations, as they appear under `tree_root`: as-is, or under the Data
@@ -256,10 +320,14 @@ impl Bases {
             let mapped = tree_root.join(path.strip_prefix("/").ok()?);
             mapped.exists().then_some(mapped)
         };
-        Bases {
-            home: std::env::var_os("HOME").map(PathBuf::from).and_then(within),
-            user_temp: user_temp_dir().and_then(within),
-        }
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let protected = PROTECTED
+            .iter()
+            .map(PathBuf::from)
+            .chain(home.as_ref().map(|home| home.join("Applications")))
+            .filter_map(within)
+            .collect();
+        Bases { home: home.and_then(within), user_temp: user_temp_dir().and_then(within), protected }
     }
 
     pub fn locate(&self, category: &Category) -> Option<PathBuf> {
@@ -299,13 +367,36 @@ mod tests {
         let home = dir.join("home");
         write(&home.join(".Trash/old.dmg"), 300_000);
         write(&home.join("Downloads/setup.pkg"), 200_000);
+        write(&home.join("code/app/package.json"), 100);
+        write(&home.join("code/app/package-lock.json"), 100);
         write(&home.join("code/app/node_modules/a/index.js"), 100_000);
         // Nested node_modules must not be counted twice.
         write(&home.join("code/app/node_modules/b/node_modules/c/index.js"), 50_000);
+        write(&home.join("code/lib/package.json"), 100);
+        write(&home.join("code/lib/pnpm-lock.yaml"), 100);
         write(&home.join("code/lib/node_modules/d/index.js"), 70_000);
+        // Not projects anyone can reinstall: an Electron app's, an editor extension's, a
+        // CLI's in ~/Library, and one without a lockfile.
+        for app in ["Applications/Editor.app/Contents/Resources/app", "Applications/Chat.app/Contents/Resources/app.asar.unpacked"] {
+            write(&home.join(app).join("package.json"), 100);
+            write(&home.join(app).join("yarn.lock"), 100);
+            write(&home.join(app).join("node_modules/e/index.js"), 90_000);
+        }
+        write(&home.join(".vscode/extensions/ext/package.json"), 100);
+        write(&home.join(".vscode/extensions/ext/package-lock.json"), 100);
+        write(&home.join(".vscode/extensions/ext/node_modules/f/index.js"), 90_000);
+        write(&home.join("Library/Application Support/Tool/package.json"), 100);
+        write(&home.join("Library/Application Support/Tool/bun.lock"), 100);
+        write(&home.join("Library/Application Support/Tool/node_modules/g/index.js"), 90_000);
+        write(&home.join("code/unlocked/package.json"), 100);
+        write(&home.join("code/unlocked/node_modules/h/index.js"), 90_000);
+        // A protected location (standing in for /Library), even with a proper project.
+        write(&dir.join("Library/Tool/package.json"), 100);
+        write(&dir.join("Library/Tool/package-lock.json"), 100);
+        write(&dir.join("Library/Tool/node_modules/i/index.js"), 90_000);
 
         let tree = scan(&dir, &Progress::default());
-        let findings = from_tree_min(&tree, &Bases { home: Some(home.clone()), user_temp: None }, 0);
+        let findings = from_tree_min(&tree, &Bases { home: Some(home.clone()), user_temp: None, protected: vec![dir.join("Library")] }, 0);
         let by_title = |title: &str| findings.iter().find(|f| f.title == title);
 
         let trash = by_title("Trash").expect("trash");
@@ -313,7 +404,7 @@ mod tests {
         assert!(by_title("Downloads").is_some());
 
         let modules = by_title("node_modules").expect("node_modules");
-        assert_eq!(modules.nodes.len(), 2, "nested node_modules counted once");
+        assert_eq!(modules.nodes.len(), 2, "only projects' node_modules, nested ones counted once");
         let expected: u64 = ["code/app/node_modules", "code/lib/node_modules"]
             .iter()
             .map(|p| tree.nodes[tree.find(&home.join(p)).unwrap()].size)
@@ -342,6 +433,23 @@ mod tests {
         assert_eq!(git.nodes, vec![big, small], "largest first, packed repository left out");
         assert_eq!(git.size, loose_objects_size(&tree, big) + loose_objects_size(&tree, small));
         assert!(loose_objects_size(&tree, big) < tree.nodes[big].size, "packs don't count");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn knows_what_is_inside_a_bundle() {
+        let dir = std::env::temp_dir().join(format!("petal-bundles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write(&dir.join("Chat.app/Contents/Resources/app.asar"), 1000);
+        write(&dir.join("code/Chat.app.md"), 1000);
+
+        let tree = scan(&dir, &Progress::default());
+        let ix = |p: &str| tree.find(&dir.join(p)).unwrap();
+        assert!(!is_inside_bundle(&tree, ix("Chat.app")), "the whole app can go");
+        assert!(is_inside_bundle(&tree, ix("Chat.app/Contents/Resources")));
+        assert!(is_inside_bundle(&tree, ix("Chat.app/Contents/Resources/app.asar")));
+        assert!(!is_inside_bundle(&tree, ix("code/Chat.app.md")));
+        assert!(is_bundle("Sparkle.framework") && is_bundle("Helper.XPC") && !is_bundle("node_modules"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

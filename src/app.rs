@@ -42,6 +42,7 @@ const DANGER: u32 = 0xe5484d;
 /// ACCENT, faint: the background of something already in the Collector.
 const ACCENT_TINT: u32 = 0x4f9dff1f;
 const SAFE: u32 = 0x3fb950;
+const WARNING: u32 = 0xd29922;
 
 const ROW_HEIGHT: f32 = 30.0;
 const ZOOM_DURATION: Duration = Duration::from_millis(450);
@@ -390,7 +391,8 @@ impl Results {
     }
 
     fn collect(&mut self, ix: usize) {
-        if self.trashing || ix == Tree::ROOT || self.tree.nodes[ix].parent.is_none() || self.tree.nodes[ix].kind == Kind::Other {
+        // Removing anything inside an app breaks it (and its code signature).
+        if self.trashing || ix == Tree::ROOT || findings::is_inside_bundle(&self.tree, ix) || self.tree.nodes[ix].parent.is_none() || self.tree.nodes[ix].kind == Kind::Other {
             return;
         }
         if self.collector.iter().any(|&c| self.tree.is_ancestor_or_self(c, ix)) {
@@ -541,6 +543,8 @@ pub struct Petal {
     /// A short confirmation at the bottom of the window; `notice_version` lets a newer
     /// one outlive the timer of the one it replaced.
     notice: Option<String>,
+    /// The notice is a warning (something wasn't done), not a confirmation.
+    notice_warning: bool,
     notice_version: u64,
     access: Access,
     _access_watch: Option<Task<()>>,
@@ -561,6 +565,7 @@ impl Petal {
             focus_handle,
             error: None,
             notice: None,
+            notice_warning: false,
             notice_version: 0,
             access,
             _access_watch: None,
@@ -946,6 +951,7 @@ impl Petal {
     }
 
     fn show_notice(&mut self, text: String, cx: &mut Context<Self>) {
+        self.notice_warning = false;
         self.notice = Some(text);
         self.notice_version += 1;
         let version = self.notice_version;
@@ -960,6 +966,29 @@ impl Petal {
             .ok();
         })
         .detach();
+        cx.notify();
+    }
+
+    fn show_warning(&mut self, text: String, cx: &mut Context<Self>) {
+        self.show_notice(text, cx);
+        self.notice_warning = true;
+    }
+
+    /// Add `nodes` to the Collector, leaving out (and saying so) anything inside an app.
+    fn collect_items(&mut self, nodes: &[usize], cx: &mut Context<Self>) {
+        let Some(r) = self.results() else { return };
+        let mut refused = 0;
+        for &ix in nodes {
+            if findings::is_inside_bundle(&r.tree, ix) {
+                refused += 1;
+            } else {
+                r.collect(ix);
+            }
+        }
+        self.collector_changed(cx);
+        if refused > 0 {
+            self.show_warning("That's part of an app: deleting it would break the app. Trash the whole app instead.".into(), cx);
+        }
         cx.notify();
     }
 
@@ -1104,7 +1133,11 @@ impl Render for Petal {
                             .shadow_lg()
                             .flex()
                             .gap_2()
-                            .child(div().text_color(rgb(SAFE)).font_weight(FontWeight::BOLD).child("✓"))
+                            .child(if self.notice_warning {
+                                div().text_color(rgb(WARNING)).font_weight(FontWeight::BOLD).child("!")
+                            } else {
+                                div().text_color(rgb(SAFE)).font_weight(FontWeight::BOLD).child("✓")
+                            })
                             .child(notice),
                     ),
                 )
@@ -1818,7 +1851,7 @@ impl Petal {
         for (i, finding) in findings.iter().enumerate() {
             let (tag, color) = match finding.safety {
                 Safety::Safe => ("Safe to delete", SAFE),
-                Safety::Review => ("Review first", 0xd29922),
+                Safety::Review => ("Review first", WARNING),
             };
             let target = finding.nodes.first().copied().filter(|_| finding.path.is_some());
             let nodes = finding.nodes.clone();
@@ -1884,13 +1917,7 @@ impl Petal {
                                         .group_hover("finding", |s| s.visible())
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             cx.stop_propagation();
-                                            if let Some(r) = this.results() {
-                                                for &ix in &nodes {
-                                                    r.collect(ix);
-                                                }
-                                            }
-                                            this.collector_changed(cx);
-                                            cx.notify();
+                                            this.collect_items(&nodes, cx);
                                         })),
                                 )
                             })
@@ -1970,6 +1997,7 @@ impl Petal {
                 let path = r.tree.path_of(ix);
                 let shown_path = r.shown_path(ix).to_string_lossy().into_owned();
                 let in_collector = is_covered(&r.tree, &collected, ix);
+                let in_app = findings::is_inside_bundle(&r.tree, ix);
 
                 div()
                     .id(("row", ix))
@@ -2032,15 +2060,11 @@ impl Petal {
                                 this.copy_to_clipboard(shown_path.clone(), notice, cx);
                             },
                         )))
-                        .when(!in_collector, |d| {
+                        .when(!in_collector && !in_app, |d| {
                             d.child(icon_button(("collect", ix), "+", "Add to Collector").on_click(cx.listener(
                                 move |this, _, _, cx| {
                                     cx.stop_propagation();
-                                    if let Some(r) = this.results() {
-                                        r.collect(ix);
-                                    }
-                                    this.collector_changed(cx);
-                                    cx.notify();
+                                    this.collect_items(&[ix], cx);
                                 },
                             )))
                         })
@@ -2164,13 +2188,7 @@ impl Petal {
             .flex_col()
             .gap_2()
             .on_drag_over::<DraggedItem>(|style, _, _, _| style.border_color(rgb(ACCENT)).bg(rgb(CARD)))
-            .on_drop(cx.listener(|this, item: &DraggedItem, _, cx| {
-                if let Some(r) = this.results() {
-                    r.collect(item.node);
-                }
-                this.collector_changed(cx);
-                cx.notify();
-            }))
+            .on_drop(cx.listener(|this, item: &DraggedItem, _, cx| this.collect_items(&[item.node], cx)))
             .child(
                 div()
                     .flex()
