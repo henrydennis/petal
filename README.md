@@ -79,7 +79,19 @@ with Apple silicon (M1 or later) running macOS 13 or later.
    **Done**, then open **System Settings › Privacy & Security**, scroll down and click **Open Anyway**
    next to the message about Petal. You only need to do this once.
 
+Notarizing Petal needs a paid Apple Developer membership. I'm working on the funds for it, and once
+it's in place this extra step goes away.
+
 All releases are on the [Releases page](https://github.com/henrydennis/petal/releases).
+
+### Homebrew
+
+```bash
+brew install --cask henrydennis/tap/petal
+```
+
+The first time Petal opens, macOS needs the same **Open Anyway** step as above, until Petal is
+notarized. Update with `brew upgrade --cask petal`.
 
 ### Build from source
 
