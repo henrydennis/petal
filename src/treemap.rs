@@ -11,9 +11,11 @@
 //! - The first layout is revealed by depth: the top level grows in first, each level inside
 //!   following a moment later.
 //! - A folder's new contents slide out from under it, moving as it moves.
-//! - Tiles that are gone shrink away where they were, fading.
+//! - Tiles that are gone shrink away where they were, fading; a folder takes its contents
+//!   with it.
 //! - Changing the folder in focus moves a camera: one affine map for the whole chart, so the
 //!   folder opens out to fill the chart (or, going up, the chart shrinks back into it).
+//!   Painting is clipped to the tile area, which tiles leave and enter by.
 //! - When the scan finishes, its chart fades away while the results are revealed in its place
 //!   (`fold`); the scan's tiles are in first-seen order and the results' largest first, so
 //!   morphing between them would only be a shuffle.
@@ -93,9 +95,12 @@ pub fn layout(segments: &[Segment], area: Bounds<Pixels>) -> Vec<Tile> {
     }
     let (cx, cy) = area.center();
     let mut placed = vec![(Rect::point(cx, cy), None::<Rect>, false); segments.len()];
-    let place = |kids: &[usize], within: Rect, placed: &mut Vec<(Rect, Option<Rect>, bool)>| {
-        let weights: Vec<f64> = kids.iter().map(|&k| (segments[k].end - segments[k].start).max(0.0) as f64).collect();
-        for (&k, slot) in kids.iter().zip(squarify(&weights, within)) {
+    let weight = |k: usize| (segments[k].end - segments[k].start).max(0.0) as f64;
+    // `whole` is the parent's own weight: tiny contents too small to show are left out of
+    // the segments, and their share is left empty rather than handed to the rest.
+    let place = |kids: &[usize], within: Rect, whole: f64, placed: &mut Vec<(Rect, Option<Rect>, bool)>| {
+        let weights: Vec<f64> = kids.iter().map(|&k| weight(k)).collect();
+        for (&k, slot) in kids.iter().zip(squarify(&weights, whole, within)) {
             let rect = slot.gap(GAP);
             let (inner, header) = if children[k].is_empty() {
                 (None, false)
@@ -109,11 +114,12 @@ pub fn layout(segments: &[Segment], area: Bounds<Pixels>) -> Vec<Tile> {
             placed[k] = (rect, inner, header);
         }
     };
-    place(&top, area, &mut placed);
+    // The top level is the whole focus folder.
+    place(&top, area, 1.0, &mut placed);
     // Parents come before their children, so each folder is placed by the time we get to it.
     for i in 0..segments.len() {
         match placed[i] {
-            (_, Some(inner), _) => place(&children[i], inner, &mut placed),
+            (_, Some(inner), _) => place(&children[i], inner, weight(i), &mut placed),
             (rect, None, _) => {
                 // No room: its contents collapse to its centre and aren't drawn.
                 let (cx, cy) = rect.center();
@@ -147,14 +153,26 @@ fn parents(segments: &[Segment]) -> Vec<Option<usize>> {
 /// Squarified treemap (Bruls, Huizing and van Wijk): split `rect` into one slot per weight,
 /// in order, with areas in proportion to the weights, keeping slots as square as it can.
 /// Rows are laid along the shorter side and grown while that improves their worst aspect
-/// ratio. Zero weights get an empty slot at the centre. Linear in the number of weights.
-fn squarify(weights: &[f64], rect: Rect) -> Vec<Rect> {
+/// ratio. Zero weights get an empty slot at the centre. `whole` is the weight of all of
+/// `rect`: when it's more than the weights add up to, the rest is left empty at the end, as
+/// if it were one more (unseen) weight. Linear in the number of weights.
+fn squarify(weights: &[f64], whole: f64, rect: Rect) -> Vec<Rect> {
     let (cx, cy) = rect.center();
-    let mut out = vec![Rect::point(cx, cy); weights.len()];
-    let items: Vec<usize> = (0..weights.len()).filter(|&i| weights[i] > 0.0 && weights[i].is_finite()).collect();
-    let total: f64 = items.iter().map(|&i| weights[i]).sum();
+    let n = weights.len();
+    // One more slot, for the remainder, dropped at the end.
+    let mut out = vec![Rect::point(cx, cy); n + 1];
+    let mut items: Vec<usize> = (0..weights.len()).filter(|&i| weights[i] > 0.0 && weights[i].is_finite()).collect();
+    let sum: f64 = items.iter().map(|&i| weights[i]).sum();
+    // Rounding in the shares is ignored: only a real remainder (over 0.1%) is left empty.
+    let rest = if whole.is_finite() && whole > sum * 1.001 { whole - sum } else { 0.0 };
+    let weights: Vec<f64> = weights.iter().copied().chain([rest]).collect();
+    if rest > 0.0 {
+        items.push(weights.len() - 1);
+    }
+    let total = sum + rest;
     let (width, height) = (rect.w() as f64, rect.h() as f64);
     if total <= 0.0 || width <= 0.0 || height <= 0.0 {
+        out.truncate(n);
         return out;
     }
     let scale = width * height / total;
@@ -208,6 +226,7 @@ fn squarify(weights: &[f64], rect: Rect) -> Vec<Rect> {
         }
         i = j;
     }
+    out.truncate(n);
     out
 }
 
@@ -277,6 +296,17 @@ impl Rect {
         Self { x0: cx + (self.x0 - cx) * k, y0: cy + (self.y0 - cy) * k, x1: cx + (self.x1 - cx) * k, y1: cy + (self.y1 - cy) * k }
     }
 
+    /// Each edge held within `to`. Holding everything the same way keeps what was inside
+    /// what, since no edge passes another.
+    fn clamped(self, to: Rect) -> Self {
+        Self { x0: self.x0.clamp(to.x0, to.x1), y0: self.y0.clamp(to.y0, to.y1), x1: self.x1.clamp(to.x0, to.x1), y1: self.y1.clamp(to.y0, to.y1) }
+    }
+
+    /// Grown by its own width and height on every side.
+    fn surroundings(self) -> Self {
+        Self { x0: self.x0 - self.w(), y0: self.y0 - self.h(), x1: self.x1 + self.w(), y1: self.y1 + self.h() }
+    }
+
     fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.x0 && x < self.x1 && y >= self.y0 && y < self.y1
     }
@@ -335,6 +365,9 @@ struct TileMotion {
     /// Where its contents go in the latest layout it was part of (the camera zooms into it).
     inner: Option<Rect>,
     depth: usize,
+    /// Its folder in the latest layout it was part of, so a folder on its way out takes its
+    /// contents with it.
+    parent: Option<Key>,
     /// Index into the latest layout; `None` once the tile has left it.
     current: Option<usize>,
     /// Colour last drawn with, for tiles that are on their way out.
@@ -434,6 +467,8 @@ pub struct PaintedTile {
     pub header: bool,
     /// Whether nothing is drawn inside it, so a label on it would be seen.
     pub leaf: bool,
+    /// The tile area, which its label is kept inside as well as its own rect.
+    pub clip: Bounds<Pixels>,
 }
 
 /// Motion for the treemap; see the module docs. The app calls `retarget` and `step` each
@@ -454,13 +489,14 @@ pub struct TreemapMotion {
     layout_id: usize,
     /// Share of the area the chart covers, across (volume scans fill it as they go).
     fraction: Spring,
-    /// Applied to the next layout: the focus changed, from one folder to another (`None`:
-    /// the root).
-    zoom: Option<(Option<Key>, Option<Key>)>,
+    /// Applied to the next layout: the focus changed, from one folder to another.
+    zoom: Option<(Key, Key)>,
     /// Seconds into revealing the first layout; `None` once done (or not started).
     reveal: Option<f32>,
     revealed: bool,
     fade: Option<Fade>,
+    /// A fold is under way: fading out, then revealing what comes next.
+    folded: bool,
 }
 
 impl Default for TreemapMotion {
@@ -479,14 +515,17 @@ impl Default for TreemapMotion {
             reveal: None,
             revealed: false,
             fade: None,
+            folded: false,
         }
     }
 }
 
 impl TreemapMotion {
-    /// The next layout is centred on a different folder: `from` is the old focus and `to`
-    /// the new one (`None`: the root). Move there as a camera would.
-    pub fn zoom(&mut self, from: Option<Key>, to: Option<Key>) {
+    /// The next layout is centred on a different folder: `from` is the old focus's key and
+    /// `to` the new one's. Move there as a camera would. The root's key (`Key::Node` of no
+    /// names) is never in a layout, so it needs no special case: going into a folder from
+    /// the root finds the folder in the old chart, and coming back out finds it in the new.
+    pub fn zoom(&mut self, from: Key, to: Key) {
         self.zoom = Some((from, to));
     }
 
@@ -502,6 +541,7 @@ impl TreemapMotion {
         }
         ghosts.extend(self.placed().into_iter().filter(|p| p.alpha >= 0.01 && p.rect.visible()).map(|p| Ghost { rect: p.rect, color: p.color, alpha: p.alpha }));
         self.fade = Some(Fade { t: 0.0, ghosts, opened: false });
+        self.folded = true;
         self.tiles.clear();
         self.layout.clear();
         self.keys.clear();
@@ -513,9 +553,9 @@ impl TreemapMotion {
     }
 
     /// Whether the chart is folding: what's drawn isn't where things are, so it shouldn't
-    /// respond to the pointer.
+    /// respond to the pointer. That lasts until what comes next is fully revealed.
     pub fn folding(&self) -> bool {
-        self.fade.is_some()
+        self.fade.is_some() || (self.folded && self.reveal.is_some())
     }
 
     pub fn fraction(&self) -> f32 {
@@ -556,23 +596,37 @@ impl TreemapMotion {
         self.area = Some(area_rect);
         let new_layout = self.layout_id != layout_id;
         let layout = layout(segments, area);
+        // Tiles the camera carries off (or brings in) go no further than an area's width or
+        // height past its edges, as the sunburst's camera stops at a full turn: zooming into a
+        // sliver of a folder can stretch the chart hundreds of times over.
+        let bounds = area_rect.surroundings();
 
-        // The camera: one map from the old chart to the new one.
+        // The camera: one map from the old chart to the new one, and the same for turns
+        // (old = new × scale + offset), so hues taken from them move with it.
         let mut camera = None;
-        if let Some((from, to)) = self.zoom.take().filter(|_| new_layout) {
+        let mut turn_camera = None;
+        // Only a new layout uses the zoom up: a new size of window alone leaves it waiting.
+        let pending = if new_layout { self.zoom.take() } else { None };
+        if let Some((from, to)) = pending {
             // Zooming in: the folder's contents (in the old chart) open out to fill the area.
-            let into = to.as_ref().and_then(|k| self.tiles.get(k)).filter(|m| m.current.is_some()).map(|m| m.inner.filter(Rect::visible).unwrap_or(m.target()));
-            camera = into.and_then(|r| Affine::between(r, area_rect));
+            if let Some(m) = self.tiles.get(&to).filter(|m| m.current.is_some()) {
+                camera = Affine::between(m.inner.filter(Rect::visible).unwrap_or(m.target()), area_rect);
+                let (t0, t1) = (m.turns[0].target, m.turns[1].target);
+                turn_camera = Some((t1 - t0, t0));
+            }
             if camera.is_none() {
                 // Zooming out: the whole old chart shrinks into the folder it showed.
-                let out_of = from.as_ref().and_then(|k| keys.iter().position(|key| key == k)).map(|i| {
+                turn_camera = None;
+                if let Some(i) = keys.iter().position(|key| *key == from) {
                     let tile = &layout[i];
-                    tile.inner.map(Rect::of).filter(Rect::visible).unwrap_or(Rect::of(tile.rect))
-                });
-                camera = out_of.and_then(|r| Affine::between(area_rect, r));
+                    camera = Affine::between(area_rect, tile.inner.map(Rect::of).filter(Rect::visible).unwrap_or(Rect::of(tile.rect)));
+                    let (f0, f1) = (segments[i].start, segments[i].end);
+                    turn_camera = (f1 > f0).then(|| (1.0 / (f1 - f0), -f0 / (f1 - f0)));
+                }
             }
             if camera.is_none() {
                 // Neither folder is in the other's chart: cross-fade.
+                turn_camera = None;
                 self.fold();
             }
         }
@@ -595,6 +649,7 @@ impl TreemapMotion {
         for (i, (key, segment)) in keys.iter().zip(segments).enumerate() {
             let tile = layout[i];
             let (target, inner) = (Rect::of(tile.rect), tile.inner.map(Rect::of));
+            let parent = parents[i].map(|p| keys[p].clone());
             if let Some(motion) = self.tiles.get_mut(key) {
                 motion.aim(target);
                 motion.turns[0].target = segment.start;
@@ -602,48 +657,59 @@ impl TreemapMotion {
                 motion.alpha.target = 1.0;
                 motion.inner = inner;
                 motion.depth = segment.depth;
+                motion.parent = parent;
                 motion.current = Some(i);
                 continue;
             }
-            let (edges, alpha) = if first {
+            let at_rest = [Spring::still(segment.start, segment.start), Spring::still(segment.end, segment.end)];
+            let (edges, turns, alpha) = if first {
                 // The reveal brings the whole first chart in.
-                (still(target), Spring::still(1.0, 1.0))
-            } else if let Some(start) = camera.and_then(|c| c.inverse()).map(|c| c.apply(target)) {
+                (still(target), at_rest, Spring::still(1.0, 1.0))
+            } else if let Some(start) = camera.and_then(|c| c.inverse()).map(|c| c.apply(target).clamped(bounds)) {
                 // Where it would have been in the old chart, had it been drawn.
-                (moving(start, target), Spring::still(0.0, 1.0))
+                let turn = |at: f32| Spring::still(turn_camera.map(|(k, o)| (at * k + o).clamp(0.0, 1.0)).unwrap_or(at), at);
+                (moving(start, target), [turn(segment.start), turn(segment.end)], Spring::still(0.0, 1.0))
             } else if let Some(p) = parents[i].filter(|p| self.tiles.contains_key(&keys[*p])) {
                 // Out from under its folder, moving as the folder moves. (A folder that's new
                 // itself is growing from its centre, so its contents grow along with it.)
+                let host = &self.tiles[&keys[p]];
                 let source = layout[p].inner.map(Rect::of).filter(Rect::visible).unwrap_or(Rect::of(layout[p].rect));
-                (along(&self.tiles[&keys[p]].edges, source, target), Spring::still(0.0, 1.0))
+                let (p0, p1) = (segments[p].start, segments[p].end);
+                // Its turns, likewise, start where they fall in the folder's as they are now.
+                let turn = |at: f32| {
+                    let t = if p1 > p0 { (at - p0) / (p1 - p0) } else { 0.0 };
+                    let (a, b) = (&host.turns[0], &host.turns[1]);
+                    Spring { x: a.x + (b.x - a.x) * t, v: a.v + (b.v - a.v) * t, target: at }
+                };
+                (along(&host.edges, source, target), [turn(segment.start), turn(segment.end)], Spring::still(0.0, 1.0))
             } else {
                 // Grow from its centre.
                 let (cx, cy) = target.center();
-                (moving(Rect::point(cx, cy), target), Spring::still(0.0, 1.0))
+                (moving(Rect::point(cx, cy), target), at_rest, Spring::still(0.0, 1.0))
             };
-            self.tiles.insert(
-                key.clone(),
-                TileMotion {
-                    edges,
-                    turns: [Spring::still(segment.start, segment.start), Spring::still(segment.end, segment.end)],
-                    alpha,
-                    inner,
-                    depth: segment.depth,
-                    current: Some(i),
-                    color: hsla(0., 0., 0., 0.),
-                },
-            );
+            self.tiles.insert(key.clone(), TileMotion { edges, turns, alpha, inner, depth: segment.depth, parent, current: Some(i), color: hsla(0., 0., 0., 0.) });
         }
         // Tiles that are gone: carried off by the camera, or shrinking away where they were.
-        for motion in self.tiles.values_mut().filter(|m| m.current.is_none()) {
+        // A folder takes its contents with it (shallowest first, so each folder is aimed by
+        // the time its contents are), so the whole of it goes as one piece.
+        let mut gone: Vec<(usize, Key)> = self.tiles.iter().filter(|(_, m)| m.current.is_none()).map(|(k, m)| (m.depth, k.clone())).collect();
+        gone.sort_by_key(|(depth, _)| *depth);
+        let mut maps: HashMap<Key, Affine> = HashMap::new();
+        for (_, key) in gone {
+            let Some(motion) = self.tiles.get_mut(&key) else { continue };
             let target = motion.target();
-            let to = match camera {
-                Some(camera) => camera.apply(target),
-                None => {
+            let carried = motion.parent.as_ref().and_then(|p| maps.get(p)).copied();
+            let to = match (carried, camera) {
+                (Some(map), _) => map.apply(target),
+                (None, Some(camera)) => camera.apply(target).clamped(bounds),
+                (None, None) => {
                     let (cx, cy) = target.center();
                     Rect::point(cx, cy)
                 }
             };
+            if let Some(map) = carried.or_else(|| Affine::between(target, to)) {
+                maps.insert(key, map);
+            }
             motion.aim(to);
             motion.alpha.target = 0.0;
         }
@@ -672,6 +738,9 @@ impl TreemapMotion {
             if fade.t >= FADE_SECONDS && fade.opened {
                 self.fade = None;
             }
+        }
+        if self.fade.is_none() && self.reveal.is_none() {
+            self.folded = false;
         }
         self.tiles.retain(|_, motion| {
             motion.step(dt);
@@ -724,21 +793,28 @@ impl TreemapMotion {
                 motion.color = color(i, motion.turns[0].x, motion.turns[1].x);
             }
         }
-        if let Some(fade) = &self.fade {
-            let k = 1.0 - smootherstep(fade.t / FADE_SECONDS);
-            for ghost in &fade.ghosts {
-                paint_tile(window, ghost.rect, ghost.color, ghost.alpha * k);
+        let Some(area) = self.area else { return Vec::new() };
+        let clip = area.bounds();
+        let placed = self.placed();
+        // Kept inside the tile area: the camera sends tiles off past its edges, and brings
+        // them in from there.
+        window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {
+            if let Some(fade) = &self.fade {
+                let k = 1.0 - smootherstep(fade.t / FADE_SECONDS);
+                for ghost in &fade.ghosts {
+                    paint_tile(window, ghost.rect, ghost.color, ghost.alpha * k);
+                }
             }
-        }
-        let mut painted = Vec::new();
-        for placed in self.placed() {
-            if paint_tile(window, placed.rect, placed.color, placed.alpha)
-                && let Some(index) = placed.index
-            {
-                painted.push(PaintedTile { index, rect: placed.rect.bounds(), alpha: placed.alpha, header: placed.header, leaf: placed.leaf });
+            let mut painted = Vec::new();
+            for placed in placed {
+                if paint_tile(window, placed.rect, placed.color, placed.alpha)
+                    && let Some(index) = placed.index
+                {
+                    painted.push(PaintedTile { index, rect: placed.rect.bounds(), alpha: placed.alpha, header: placed.header, leaf: placed.leaf, clip });
+                }
             }
-        }
-        painted
+            painted
+        })
     }
 }
 
@@ -774,6 +850,7 @@ fn fit(window: &Window, text: &SharedString, font: &Font, font_size: f32, color:
     if max_width <= 0.0 || text.is_empty() {
         return None;
     }
+    let text = one_line(text);
     let full = shape(text.clone());
     if f32::from(full.width()) <= max_width {
         return Some(full);
@@ -791,6 +868,12 @@ fn fit(window: &Window, text: &SharedString, font: &Font, font_size: f32, color:
         }
     }
     (lo > 0).then(|| shape(cut(lo)))
+}
+
+/// `text` with any line breaks made spaces: a file name can hold them, and a shaped line
+/// mustn't (gpui asserts it doesn't).
+fn one_line(text: &SharedString) -> SharedString {
+    if text.contains(['\n', '\r']) { text.replace(['\n', '\r'], " ").into() } else { text.clone() }
 }
 
 /// Paint a shaped line at `origin`, clipped to `clip`.
@@ -833,12 +916,14 @@ pub fn paint_labels(painted: &[PaintedTile], label: impl Fn(usize) -> Option<(Sh
         if tile.alpha < 0.05 {
             continue;
         }
+        // Clipped to the tile, within the tile area (clamping to it is intersecting with it).
+        let area = Rect::of(tile.clip);
         if tile.header {
             if rect.w() < 40.0 || rect.h() < HEADER {
                 continue;
             }
             let Some((name, size, bar)) = label(tile.index) else { continue };
-            let strip = Rect { y1: rect.y0 + HEADER, ..rect };
+            let strip = Rect { y1: rect.y0 + HEADER, ..rect }.clamped(area);
             let origin = point(px(rect.x0 + PAD), px(rect.y0));
             paint_name_and_size(&name, &size, &medium, ink(bar, tile.alpha), origin, rect.w() - 2.0 * PAD, HEADER, strip, window, cx);
         } else if tile.leaf {
@@ -848,13 +933,14 @@ pub fn paint_labels(painted: &[PaintedTile], label: impl Fn(usize) -> Option<(Sh
             let Some((name, size, bar)) = label(tile.index) else { continue };
             let ink = ink(bar, tile.alpha);
             let max_width = rect.w() - 2.0 * PAD;
+            let clip = rect.clamped(area);
             if let Some(line) = fit(window, &name, &medium, 12.0, ink, max_width) {
-                paint_line(&line, point(px(rect.x0 + PAD), px(rect.y0 + 1.0)), 16.0, rect, window, cx);
+                paint_line(&line, point(px(rect.x0 + PAD), px(rect.y0 + 1.0)), 16.0, clip, window, cx);
             }
             if rect.h() >= 32.0
                 && let Some(line) = fit(window, &size, &regular, 11.0, faded(ink, 0.8), max_width)
             {
-                paint_line(&line, point(px(rect.x0 + PAD), px(rect.y0 + 16.0)), 14.0, rect, window, cx);
+                paint_line(&line, point(px(rect.x0 + PAD), px(rect.y0 + 16.0)), 14.0, clip, window, cx);
             }
         }
     }
@@ -887,6 +973,11 @@ mod tests {
 
     fn key(path: &str) -> Key {
         Key::Node(path.split('/').map(SharedString::from).collect())
+    }
+
+    /// The root's key, as the app makes it: no names.
+    fn root_key() -> Key {
+        Key::Node(Vec::new())
     }
 
     fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> Rect {
@@ -948,7 +1039,7 @@ mod tests {
     fn slots_tile_the_rect_in_proportion() {
         let weights = [6.0, 4.0, 3.0, 2.0, 1.0, 1.0, 0.5];
         let within = rect(10.0, 20.0, 310.0, 220.0);
-        let slots = squarify(&weights, within);
+        let slots = squarify(&weights, 0.0, within);
         let total: f64 = weights.iter().sum();
         let whole = within.w() * within.h();
         let mut covered = 0.0;
@@ -969,12 +1060,12 @@ mod tests {
     #[test]
     fn zero_weights_and_a_single_child() {
         let within = rect(0.0, 0.0, 100.0, 50.0);
-        let slots = squarify(&[0.0, 1.0, 0.0], within);
+        let slots = squarify(&[0.0, 1.0, 0.0], 0.0, within);
         assert!(!slots[0].visible() && !slots[2].visible());
         assert_eq!(slots[1], within);
-        assert_eq!(squarify(&[2.5], within), [within]);
-        assert!(squarify(&[0.0, 0.0], within).iter().all(|s| !s.visible() && sane(*s)));
-        assert!(squarify(&[1.0, 1.0], rect(5.0, 5.0, 5.0, 5.0)).iter().all(|s| sane(*s)));
+        assert_eq!(squarify(&[2.5], 0.0, within), [within]);
+        assert!(squarify(&[0.0, 0.0], 0.0, within).iter().all(|s| !s.visible() && sane(*s)));
+        assert!(squarify(&[1.0, 1.0], 0.0, rect(5.0, 5.0, 5.0, 5.0)).iter().all(|s| sane(*s)));
 
         // A folder with one child: it fills the folder's inner rect, less the gap.
         let tiles = check_layout(&[seg(0.0, 1.0, 1), seg(0.0, 1.0, 2)], area());
@@ -1156,7 +1247,7 @@ mod tests {
         let old_a = motion.tiles[&key("a")].inner.unwrap();
 
         // Into "a": its contents fill the area, "b" is pushed off past the edge.
-        motion.zoom(None, Some(key("a")));
+        motion.zoom(root_key(), key("a"));
         let keys = [key("a/x"), key("a/x/p"), key("a/y")];
         motion.retarget(2, &keys, &[seg(0.0, 0.5, 1), seg(0.0, 0.5, 2), seg(0.5, 1.0, 1)], area(), 1.0);
         assert!(inside(now(&motion, "a/x/p"), old_a), "new tiles start inside the folder zoomed into");
@@ -1168,7 +1259,7 @@ mod tests {
         assert!(at_targets(&motion));
 
         // And back out: the chart shrinks into "a", and "b" comes back in from outside.
-        motion.zoom(Some(key("a")), None);
+        motion.zoom(key("a"), root_key());
         let (keys, segments) = root();
         motion.retarget(3, &keys, &segments, area(), 1.0);
         let (a, b) = (now(&motion, "a"), now(&motion, "b"));
@@ -1187,7 +1278,7 @@ mod tests {
         let (keys, segments) = root();
         motion.retarget(1, &keys, &segments, area(), 1.0);
         run(&mut motion, &mut t, |_| {});
-        motion.zoom(Some(key("q")), Some(key("r")));
+        motion.zoom(key("q"), key("r"));
         motion.retarget(2, &[key("r/1")], &[seg(0.0, 1.0, 1)], area(), 1.0);
         assert!(motion.folding() && motion.reveal.is_some());
         run(&mut motion, &mut t, |_| {});
@@ -1259,5 +1350,238 @@ mod tests {
         assert_eq!(motion.tiles(), layout(&segments, bigger).as_slice());
         run(&mut motion, &mut t, |_| {});
         assert!(at_targets(&motion));
+    }
+
+    #[test]
+    fn what_a_folder_doesnt_show_is_left_empty() {
+        // A weight of 3 in a rect worth 4 covers three quarters of it, leaving the rest.
+        let within = rect(0.0, 0.0, 100.0, 100.0);
+        let slots = squarify(&[2.0, 1.0], 4.0, within);
+        let share = |r: Rect| r.w() * r.h() / (100.0 * 100.0);
+        assert!((share(slots[0]) - 0.5).abs() < 0.005 && (share(slots[1]) - 0.25).abs() < 0.005, "{slots:?}");
+        // Shares that only miss by rounding still fill it.
+        let slots = squarify(&[1.0, 1.0], 2.0005, within);
+        assert!((share(slots[0]) + share(slots[1]) - 1.0).abs() < 1e-4);
+
+        // A folder of 0.6 showing one child of 0.45 (the rest too small to show): the child
+        // covers three quarters of the folder's contents, not all of it.
+        let tiles = check_layout(&[seg(0.0, 0.6, 1), seg(0.0, 0.45, 2), seg(0.6, 1.0, 1)], area());
+        let (inner, child) = (Rect::of(tiles[0].inner.unwrap()), Rect::of(tiles[1].rect));
+        let covered = (child.w() + 2.0 * GAP) * (child.h() + 2.0 * GAP) / (inner.w() * inner.h());
+        assert!((covered - 0.75).abs() < 0.0075, "covers {covered}");
+    }
+
+    #[test]
+    fn labels_are_one_line() {
+        assert_eq!(one_line(&"a\nb\r\nc".into()), SharedString::from("a b  c"));
+        assert_eq!(one_line(&"plain".into()), SharedString::from("plain"));
+    }
+
+    #[test]
+    fn a_pending_zoom_waits_for_the_next_layout() {
+        let mut motion = TreemapMotion::default();
+        let mut t = Instant::now();
+        let (keys, segments) = root();
+        motion.retarget(1, &keys, &segments, area(), 1.0);
+        run(&mut motion, &mut t, |_| {});
+        motion.zoom(root_key(), key("a"));
+        // The window is resized before the zoomed layout arrives.
+        let wider = rect(0.0, 0.0, 1000.0, 600.0).bounds();
+        motion.retarget(1, &keys, &segments, wider, 1.0);
+        assert!(motion.zoom.is_some(), "a resize doesn't use the zoom up");
+        let old_a = motion.tiles[&key("a")].inner.unwrap();
+        motion.retarget(2, &[key("a/x"), key("a/x/p"), key("a/y")], &[seg(0.0, 0.5, 1), seg(0.0, 0.5, 2), seg(0.5, 1.0, 1)], wider, 1.0);
+        assert!(motion.zoom.is_none() && !motion.folding());
+        assert!(inside(now(&motion, "a/x/p"), old_a), "the camera was applied");
+        let frames = run(&mut motion, &mut t, |_| {});
+        assert!(frames < 75 && at_targets(&motion), "took {frames} frames");
+    }
+
+    #[test]
+    fn contents_appearing_under_a_moving_folder_move_with_it() {
+        let mut motion = TreemapMotion::default();
+        let mut t = Instant::now();
+        motion.retarget(1, &[key("a"), key("b")], &[seg(0.0, 0.5, 1), seg(0.5, 1.0, 1)], area(), 1.0);
+        run(&mut motion, &mut t, |_| {});
+        // "a" starts growing...
+        motion.retarget(2, &[key("a"), key("b")], &[seg(0.0, 0.8, 1), seg(0.8, 1.0, 1)], area(), 1.0);
+        for _ in 0..5 {
+            motion.step(t);
+            t += Duration::from_millis(16);
+        }
+        let host = motion.tiles[&key("a")].edges;
+        let host_turns = motion.tiles[&key("a")].turns;
+        assert!(host.iter().any(|e| e.v.abs() > 1.0), "a is moving");
+        // ...and, part way, its contents appear.
+        let keys = [key("a"), key("a/x"), key("a/y"), key("b")];
+        let segments = [seg(0.0, 0.8, 1), seg(0.0, 0.5, 2), seg(0.5, 0.8, 2), seg(0.8, 1.0, 1)];
+        motion.retarget(3, &keys, &segments, area(), 1.0);
+        let source = Rect::of(motion.layout[0].inner.unwrap());
+        for (i, child) in [(1, "a/x"), (2, "a/y")] {
+            let m = &motion.tiles[&key(child)];
+            assert!(inside(m.rect(), now(&motion, "a")), "{child} starts inside a as drawn");
+            // Each edge has the speed of the point of "a" it starts at.
+            let target = Rect::of(motion.layout[i].rect);
+            let tx = |at: f32| (at - source.x0) / source.w();
+            let ty = |at: f32| (at - source.y0) / source.h();
+            let lerp = |a: &Spring, b: &Spring, t: f32| a.v + (b.v - a.v) * t;
+            let want = [lerp(&host[0], &host[2], tx(target.x0)), lerp(&host[1], &host[3], ty(target.y0)), lerp(&host[0], &host[2], tx(target.x1)), lerp(&host[1], &host[3], ty(target.y1))];
+            for (edge, v) in m.edges.iter().zip(want) {
+                assert!((edge.v - v).abs() < 1e-3, "{child}: {} vs {v}", edge.v);
+            }
+            // Its turns start where they fall in a's turns as they are now.
+            let turn = |at: f32| host_turns[0].x + (host_turns[1].x - host_turns[0].x) * at / 0.8;
+            assert!((m.turns[0].x - turn(segments[i].start)).abs() < 1e-4 && (m.turns[1].x - turn(segments[i].end)).abs() < 1e-4);
+        }
+        run(&mut motion, &mut t, |m| {
+            for child in ["a/x", "a/y"] {
+                let (r, a) = (now(m, child), now(m, "a"));
+                assert!(r.x0 >= a.x0 - 0.5 && r.y0 >= a.y0 - 0.5 && r.x1 <= a.x1 + 0.5 && r.y1 <= a.y1 + 0.5, "{child} stays inside a: {r:?} {a:?}");
+            }
+        });
+        assert!(at_targets(&motion));
+    }
+
+    #[test]
+    fn retargeting_mid_flight_keeps_position_and_speed() {
+        let mut motion = TreemapMotion::default();
+        let mut t = Instant::now();
+        let (keys, segments) = root();
+        motion.retarget(1, &keys, &segments, area(), 1.0);
+        run(&mut motion, &mut t, |_| {});
+        motion.retarget(2, &keys, &[seg(0.0, 0.3, 1), seg(0.0, 0.1, 2), seg(0.1, 0.3, 2), seg(0.3, 1.0, 1)], area(), 1.0);
+        for _ in 0..6 {
+            motion.step(t);
+            t += Duration::from_millis(16);
+        }
+        let before: Vec<(Rect, [f32; 4])> = keys.iter().map(|k| (motion.tiles[k].rect(), motion.tiles[k].edges.map(|e| e.v))).collect();
+        assert!(before.iter().any(|(_, v)| v.iter().any(|v| v.abs() > 1.0)), "something is moving");
+        motion.retarget(3, &keys, &[seg(0.0, 0.5, 1), seg(0.0, 0.4, 2), seg(0.4, 0.5, 2), seg(0.5, 1.0, 1)], area(), 1.0);
+        for (k, (rect, v)) in keys.iter().zip(before) {
+            assert_eq!(motion.tiles[k].rect(), rect);
+            assert_eq!(motion.tiles[k].edges.map(|e| e.v), v);
+        }
+        run(&mut motion, &mut t, |_| {});
+        assert!(at_targets(&motion));
+    }
+
+    #[test]
+    fn a_new_folder_brings_its_new_contents_with_it() {
+        let mut motion = TreemapMotion::default();
+        let mut t = Instant::now();
+        motion.retarget(1, &[key("a")], &[seg(0.0, 1.0, 1)], area(), 1.0);
+        run(&mut motion, &mut t, |_| {});
+        let keys = [key("a"), key("c"), key("c/x"), key("c/y")];
+        motion.retarget(2, &keys, &[seg(0.0, 0.6, 1), seg(0.6, 1.0, 1), seg(0.6, 0.8, 2), seg(0.8, 1.0, 2)], area(), 1.0);
+        let check = |m: &TreemapMotion| {
+            for child in ["c/x", "c/y"] {
+                let (r, c) = (now(m, child), now(m, "c"));
+                assert!(r.x0 >= c.x0 - 0.5 && r.y0 >= c.y0 - 0.5 && r.x1 <= c.x1 + 0.5 && r.y1 <= c.y1 + 0.5, "{child} inside c: {r:?} {c:?}");
+            }
+        };
+        check(&motion);
+        run(&mut motion, &mut t, check);
+        assert!(at_targets(&motion));
+    }
+
+    #[test]
+    fn a_departing_folder_takes_its_contents_with_it() {
+        let mut motion = TreemapMotion::default();
+        let mut t = Instant::now();
+        let (keys, segments) = root();
+        motion.retarget(1, &keys, &segments, area(), 1.0);
+        run(&mut motion, &mut t, |_| {});
+        // "a" goes, with everything in it.
+        motion.retarget(2, &[key("b")], &[seg(0.0, 1.0, 1)], area(), 1.0);
+        let mut checked = 0;
+        let frames = run(&mut motion, &mut t, |m| {
+            let Some(a) = m.tiles.get(&key("a")).map(TileMotion::rect) else { return };
+            for child in ["a/x", "a/y"] {
+                let Some(c) = m.tiles.get(&key(child)) else { continue };
+                if c.alpha.x > 0.01 && c.rect().visible() {
+                    let r = c.rect();
+                    assert!(r.x0 >= a.x0 - 0.5 && r.y0 >= a.y0 - 0.5 && r.x1 <= a.x1 + 0.5 && r.y1 <= a.y1 + 0.5, "{child} inside a as it goes: {r:?} {a:?}");
+                    checked += 1;
+                }
+            }
+        });
+        assert!(checked > 10 && frames < 75);
+        assert!(motion.tiles.len() == 1 && at_targets(&motion));
+    }
+
+    #[test]
+    fn zooming_into_a_sliver_stays_near_the_chart() {
+        let mut motion = TreemapMotion::default();
+        let mut t = Instant::now();
+        // A folder of half a percent, laid out as a thin column down the side.
+        let keys = [key("big"), key("big/1"), key("thin")];
+        let segments = [seg(0.0, 0.995, 1), seg(0.0, 0.995, 2), seg(0.995, 1.0, 1)];
+        motion.retarget(1, &keys, &segments, area(), 1.0);
+        run(&mut motion, &mut t, |_| {});
+        let thin = Rect::of(motion.layout[2].rect);
+        assert!(thin.w() < 10.0 && thin.h() > 500.0, "{thin:?}");
+        let bounds = Rect::of(area()).surroundings();
+        let near = |m: &TreemapMotion| {
+            for p in m.placed().iter().filter(|p| p.alpha >= 0.01 && p.rect.visible()) {
+                assert!(inside(p.rect, bounds), "{:?} strays from the chart", p.rect);
+            }
+        };
+
+        motion.zoom(root_key(), key("thin"));
+        motion.retarget(2, &[key("thin/a"), key("thin/b")], &[seg(0.0, 0.6, 1), seg(0.6, 1.0, 1)], area(), 1.0);
+        assert!(!motion.folding(), "zoomed, not cross-faded");
+        near(&motion);
+        let frames = run(&mut motion, &mut t, near);
+        assert!(frames < 75 && at_targets(&motion), "in took {frames} frames");
+
+        motion.zoom(key("thin"), root_key());
+        motion.retarget(3, &keys, &segments, area(), 1.0);
+        near(&motion);
+        let frames = run(&mut motion, &mut t, near);
+        assert!(frames < 75 && at_targets(&motion), "out took {frames} frames");
+    }
+
+    #[test]
+    fn new_tiles_hues_move_with_the_camera() {
+        let mut motion = TreemapMotion::default();
+        let mut t = Instant::now();
+        let (keys, segments) = root();
+        motion.retarget(1, &keys, &segments, area(), 1.0);
+        run(&mut motion, &mut t, |_| {});
+        // Into "a" (0 to 0.6 turns): what's new starts at its turns within a's.
+        motion.zoom(root_key(), key("a"));
+        motion.retarget(2, &[key("a/x"), key("a/x/p"), key("a/y")], &[seg(0.0, 0.5, 1), seg(0.0, 0.5, 2), seg(0.5, 1.0, 1)], area(), 1.0);
+        let p = &motion.tiles[&key("a/x/p")].turns;
+        assert!(p[0].x.abs() < 1e-5 && (p[1].x - 0.3).abs() < 1e-5 && (p[1].target - 0.5).abs() < 1e-5);
+        run(&mut motion, &mut t, |_| {});
+        // Back out: "b" comes in from past the end of the turns "a" covered.
+        motion.zoom(key("a"), root_key());
+        motion.retarget(3, &keys, &segments, area(), 1.0);
+        let b = &motion.tiles[&key("b")].turns;
+        assert!((b[0].x - 1.0).abs() < 1e-5 && (b[1].x - 1.0).abs() < 1e-5 && (b[0].target - 0.6).abs() < 1e-5);
+    }
+
+    #[test]
+    fn folding_lasts_until_the_results_are_revealed() {
+        let mut motion = TreemapMotion::default();
+        let mut t = Instant::now();
+        let (keys, segments) = root();
+        motion.retarget(1, &keys, &segments, area(), 1.0);
+        run(&mut motion, &mut t, |_| {});
+        assert!(!motion.folding(), "the first reveal isn't a fold");
+        motion.fold();
+        let mut revealing_after_fade = false;
+        loop {
+            motion.retarget(2, &keys, &segments, area(), 1.0);
+            if !motion.step(t) {
+                break;
+            }
+            if motion.reveal.is_some() {
+                assert!(motion.folding(), "still folding while the results are revealed");
+                revealing_after_fade |= motion.fade.is_none();
+            }
+            t += Duration::from_millis(16);
+        }
+        assert!(revealing_after_fade && !motion.folding());
     }
 }
