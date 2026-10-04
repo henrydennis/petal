@@ -366,6 +366,9 @@ struct Results {
     trashed: Option<Trashed>,
     /// Reading the unreadable folders as an administrator.
     admin: AdminRead,
+    /// Folders read as an administrator. Reading them again as this user would lose what
+    /// the administrator saw, so changes there aren't followed (see `check_changes`).
+    admin_paths: HashSet<PathBuf>,
     /// Time Machine snapshots are being deleted.
     deleting_snapshots: bool,
 }
@@ -428,6 +431,7 @@ impl Results {
             trashing: false,
             trashed: None,
             admin: AdminRead::Offered,
+            admin_paths: HashSet::new(),
             deleting_snapshots: false,
         };
         results.homes = home_folders(&results.tree);
@@ -1016,6 +1020,21 @@ impl Petal {
         // Anything inside a folder that's being rescanned whole comes along with it.
         let whole: Vec<usize> = folders.iter().filter(|&(_, &recursive)| recursive).map(|(&ix, _)| ix).collect();
         folders.retain(|&ix, _| !whole.iter().any(|&w| w != ix && r.tree.is_ancestor_or_self(w, ix)));
+        // Folders read as an administrator can't be read again as this user without losing
+        // what's in them: leave them (and rescans of what holds them), and say the results
+        // may be out of date.
+        if !r.admin_paths.is_empty() {
+            let (tree, admin_paths) = (&r.tree, &r.admin_paths);
+            let before = folders.len();
+            folders.retain(|&ix, &mut recursive| {
+                let path = tree.path_of(ix);
+                !admin_paths.iter().any(|admin| path.starts_with(admin) || (recursive && admin.starts_with(&path)))
+            });
+            if folders.len() < before && !r.out_of_date {
+                r.out_of_date = true;
+                cx.notify();
+            }
+        }
         if folders.is_empty() {
             return true;
         }
@@ -1030,9 +1049,10 @@ impl Petal {
             })
             .collect();
         let root = tree.root_path.clone();
+        let startup = r.requested_root == std::path::Path::new("/");
         r.refreshing = true;
         cx.spawn(async move |this, cx| {
-            let (fresh, errors) = cx
+            let (fresh, errors, volumes) = cx
                 .background_spawn(async move {
                     let (count, whole, started) = (stale.len(), stale.iter().filter(|s| s.recursive).count(), Instant::now());
                     let errors = std::sync::atomic::AtomicU64::new(0);
@@ -1040,23 +1060,24 @@ impl Petal {
                     if std::env::var_os("PETAL_TIMING").is_some() {
                         eprintln!("changes: read {count} folders ({whole} whole) in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
                     }
-                    (fresh, errors.into_inner())
+                    let volumes = if startup { scan::startup_volumes() } else { None };
+                    (fresh, errors.into_inner(), volumes)
                 })
                 .await;
-            this.update(cx, |this, cx| this.apply_fresh(id, fresh, errors, cx)).ok();
+            this.update(cx, |this, cx| this.apply_fresh(id, fresh, errors, volumes, cx)).ok();
         })
         .detach();
         true
     }
 
     /// Fold re-read folders into the tree, and keep the focus, Collector and findings in step.
-    fn apply_fresh(&mut self, id: u64, fresh: Vec<(usize, scan::Fresh)>, errors: u64, cx: &mut Context<Self>) {
+    fn apply_fresh(&mut self, id: u64, fresh: Vec<(usize, scan::Fresh)>, errors: u64, volumes: Option<scan::StartupVolumes>, cx: &mut Context<Self>) {
         let Some(r) = self.results() else { return };
         if r.id != id {
             return;
         }
         r.refreshing = false;
-        self.splice(fresh, errors, cx);
+        self.splice(fresh, errors, volumes, cx);
     }
 
     /// Read the folders the scan couldn't, as an administrator (macOS asks for a password),
@@ -1073,7 +1094,7 @@ impl Petal {
             .iter()
             .filter_map(|u| {
                 let ix = tree.find(&u.path).filter(|&ix| tree.nodes[ix].kind == Kind::Dir)?;
-                sent.push(u.clone());
+                sent.push((ix, u.clone()));
                 Some(scan::Stale {
                     ix,
                     path: u.path.clone(),
@@ -1087,17 +1108,32 @@ impl Petal {
             return;
         }
         let job = admin::Job::Read { root: tree.root_path.clone(), stale, hardlinks: tree.hardlinks.clone() };
+        let startup = r.requested_root == std::path::Path::new("/");
         r.admin = AdminRead::Reading;
         let id = r.id;
         cx.spawn(async move |this, cx| {
-            let result = cx.background_spawn(async move { admin::run(&job, ADMIN_READ_PROMPT) }).await;
-            this.update(cx, |this, cx| this.admin_read_done(id, sent, result, cx)).ok();
+            let (result, volumes) = cx
+                .background_spawn(async move {
+                    let result = admin::run(&job, ADMIN_READ_PROMPT);
+                    let volumes = if startup && result.is_ok() { scan::startup_volumes() } else { None };
+                    (result, volumes)
+                })
+                .await;
+            this.update(cx, |this, cx| this.admin_read_done(id, sent, result, volumes, cx)).ok();
         })
         .detach();
         cx.notify();
     }
 
-    fn admin_read_done(&mut self, id: u64, sent: Vec<scan::Unreadable>, result: Result<admin::Outcome, admin::Error>, cx: &mut Context<Self>) {
+    /// `sent`: each folder sent to the helper, with its node when it was sent.
+    fn admin_read_done(
+        &mut self,
+        id: u64,
+        sent: Vec<(usize, scan::Unreadable)>,
+        result: Result<admin::Outcome, admin::Error>,
+        volumes: Option<scan::StartupVolumes>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(r) = self.results() else { return };
         if r.id != id {
             return;
@@ -1116,16 +1152,28 @@ impl Petal {
             }
         };
         let read_before = scanned_size(&r.tree);
+        // While the password dialog was up, a refresh from disk may have replaced a folder's
+        // node (or removed the folder): find each one again by its path.
+        let fresh: Vec<(usize, scan::Fresh)> = read
+            .fresh
+            .into_iter()
+            .filter_map(|(ix, fresh)| {
+                let (_, unreadable) = sent.iter().find(|(sent_ix, _)| *sent_ix == ix)?;
+                let now = r.tree.find(&unreadable.path).filter(|&n| r.tree.nodes[n].kind == Kind::Dir)?;
+                r.admin_paths.insert(unreadable.path.clone());
+                Some((now, fresh))
+            })
+            .collect();
         // The folders sent are accounted for again by what came back.
-        r.tree.errors = r.tree.errors.saturating_sub(sent.iter().map(|u| u.errors).sum());
-        r.tree.unreadable.retain(|u| !sent.contains(u));
+        r.tree.errors = r.tree.errors.saturating_sub(sent.iter().map(|(_, u)| u.errors).sum());
+        r.tree.unreadable.retain(|u| !sent.iter().any(|(_, s)| s == u));
         r.tree.unreadable.extend(read.unreadable);
         if r.tree.unreadable.is_empty() {
             r.tree.hardlinks = HashSet::new();
         }
         r.admin = AdminRead::Done;
         let still = r.tree.unreadable.len();
-        self.splice(read.fresh, read.errors, cx);
+        self.splice(fresh, read.errors, volumes, cx);
         let Some(r) = self.results() else { return };
         let found = scanned_size(&r.tree).saturating_sub(read_before);
         let notice = match still {
@@ -1186,7 +1234,7 @@ impl Petal {
                     if outcome.is_ok() {
                         std::thread::sleep(Duration::from_secs(2));
                     }
-                    outcome
+                    Ok((outcome?, scan::startup_volumes()))
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -1196,8 +1244,10 @@ impl Petal {
                 }
                 r.deleting_snapshots = false;
                 match result {
-                    Ok(admin::Outcome::Deleted { failed }) => {
-                        scan::refresh_volume_slices(&mut r.tree);
+                    Ok((admin::Outcome::Deleted { failed }, volumes)) => {
+                        if let Some(volumes) = volumes {
+                            scan::refresh_volume_slices(&mut r.tree, volumes);
+                        }
                         r.relayout();
                         let freed = before.saturating_sub(remainder_size(&r.tree));
                         match failed.first() {
@@ -1223,10 +1273,12 @@ impl Petal {
         cx.spawn(async move |this, cx| {
             for wait in [10, 30] {
                 cx.background_executor().timer(Duration::from_secs(wait)).await;
+                let volumes = cx.background_spawn(async { scan::startup_volumes() }).await;
                 let gone = this
                     .update(cx, |this, cx| {
                         let Some(r) = this.results().filter(|r| r.id == id) else { return true };
-                        scan::refresh_volume_slices(&mut r.tree);
+                        let Some(volumes) = volumes else { return true };
+                        scan::refresh_volume_slices(&mut r.tree, volumes);
                         r.relayout();
                         cx.notify();
                         false
@@ -1331,7 +1383,9 @@ impl Petal {
 
     /// Bring folders that were read again into the results: sizes, the volume slices,
     /// findings and the Collector.
-    fn splice(&mut self, fresh: Vec<(usize, scan::Fresh)>, errors: u64, cx: &mut Context<Self>) {
+    /// `volumes`: the startup disk as it is now, read in the background, when that's what was
+    /// scanned.
+    fn splice(&mut self, fresh: Vec<(usize, scan::Fresh)>, errors: u64, volumes: Option<scan::StartupVolumes>, cx: &mut Context<Self>) {
         let Some(r) = self.results() else { return };
         let touched: Vec<usize> = fresh.iter().map(|(ix, _)| *ix).collect();
         let focus_path = path_to(&r.tree, r.focus);
@@ -1343,8 +1397,8 @@ impl Petal {
         if scan::apply_changes(&mut r.tree, fresh) == 0 {
             return;
         }
-        if r.requested_root == std::path::Path::new("/") {
-            scan::refresh_volume_slices(&mut r.tree);
+        if let Some(volumes) = volumes {
+            scan::refresh_volume_slices(&mut r.tree, volumes);
         }
         // A folder that's gone (or renamed) leaves the view at its nearest surviving parent.
         r.focus = resolve_path(&r.tree, &focus_path);

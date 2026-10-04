@@ -918,10 +918,22 @@ pub fn apply_changes(tree: &mut Tree, fresh: Vec<(usize, Fresh)>) -> usize {
     changed
 }
 
+/// What `refresh_volume_slices` needs to know about the startup disk. Reading it can take
+/// tens of milliseconds (purgeable space asks a system service), so do it off the UI thread.
+pub struct StartupVolumes {
+    layout: DiskLayout,
+    purgeable: Option<u64>,
+}
+
+pub fn startup_volumes() -> Option<StartupVolumes> {
+    let layout = disk::startup_layout(startup_disk_name())?;
+    Some(StartupVolumes { layout, purgeable: disk::purgeable(Path::new("/")) })
+}
+
 /// On the startup disk, refresh the exact per-volume slices so the chart still adds up to
 /// the disk's used space after changes.
-pub fn refresh_volume_slices(tree: &mut Tree) {
-    let Some(layout) = disk::startup_layout(startup_disk_name()) else { return };
+pub fn refresh_volume_slices(tree: &mut Tree, volumes: StartupVolumes) {
+    let StartupVolumes { layout, purgeable } = volumes;
     if layout.data_root != tree.root_path {
         return;
     }
@@ -954,7 +966,7 @@ pub fn refresh_volume_slices(tree: &mut Tree) {
     tree.nodes[Tree::ROOT].size = total;
     sort_children(&mut tree.nodes, Tree::ROOT);
     tree.snapshots = layout.snapshots;
-    tree.purgeable = disk::purgeable(Path::new("/"));
+    tree.purgeable = purgeable;
 }
 
 fn flatten(raw: Raw, parent: Option<usize>, nodes: &mut Vec<Node>) -> usize {
