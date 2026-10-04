@@ -1394,11 +1394,18 @@ impl Petal {
             _ => None,
         };
         r.tree.errors += errors;
-        if scan::apply_changes(&mut r.tree, fresh) == 0 {
-            return;
-        }
+        let changed = scan::apply_changes(&mut r.tree, fresh);
+        // The volumes' usage can change without any folder here changing (another user's
+        // files, snapshots), and was read anyway.
         if let Some(volumes) = volumes {
             scan::refresh_volume_slices(&mut r.tree, volumes);
+            if changed == 0 {
+                r.relayout();
+                cx.notify();
+            }
+        }
+        if changed == 0 {
+            return;
         }
         // A folder that's gone (or renamed) leaves the view at its nearest surviving parent.
         r.focus = resolve_path(&r.tree, &focus_path);
