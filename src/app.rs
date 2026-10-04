@@ -57,8 +57,9 @@ enum ColorBy {
     Kind,
 }
 
-/// How the chart is drawn. All three show the same layout (`sunburst::layout`), so colours,
-/// hover and zoom mean the same thing in each.
+/// How the chart is drawn. All three show the same layout (`sunburst::layout`; the treemap
+/// just its top level, see `ChartType::layout`), so colours, hover and zoom mean the same
+/// thing in each.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ChartType {
     /// Rings round the folder in focus.
@@ -66,8 +67,22 @@ pub enum ChartType {
     /// The sunburst unrolled into columns, one per level, with room for names along each bar
     /// (see `Geometry::icicle`).
     Icicle,
-    /// Nested boxes sized by area (see `treemap`): a big file deep inside a folder is a big box.
+    /// Boxes sized by area (see `treemap`), one for each thing in the folder in focus; click
+    /// a folder's box to zoom into it.
     Treemap,
+}
+
+impl ChartType {
+    /// The chart's segments for the folder `focus`: as many levels as the sunburst and icicle
+    /// have rings and columns for, and just the one for the treemap, which shows one level at
+    /// a time. Keys, labels, swatches and categories are all made from these, so they line up
+    /// whichever it is.
+    fn layout(self, tree: &Tree, focus: usize) -> Vec<Segment> {
+        match self {
+            ChartType::Sunburst | ChartType::Icicle => sunburst::layout(tree, focus),
+            ChartType::Treemap => sunburst::layout_to(tree, focus, 1),
+        }
+    }
 }
 
 /// How long a notice ("Copied …") stays up.
@@ -141,6 +156,17 @@ struct Scanning {
     _tasks: [Task<()>; 2],
 }
 
+impl Scanning {
+    /// Take a fresh snapshot of the running totals for the live chart, laid out for `chart`.
+    fn snapshot(&mut self, chart: ChartType) {
+        let layout = self.progress.layout.get().map(|l| &**l);
+        let root = layout.map(|l| l.data_root.clone()).unwrap_or_else(|| self.root.clone());
+        let snapshot = live::snapshot(&self.progress.live, &root, layout);
+        self.live = Some(Rc::new(LiveView::new(snapshot, chart)));
+        self.last_snapshot = clock::now();
+    }
+}
+
 /// A snapshot of the running totals, laid out. The scan's chart is look-only: the mouse
 /// does nothing until the results are up, so nothing under the pointer changes as the
 /// chart grows beneath it.
@@ -160,6 +186,9 @@ struct LiveView {
     labels: Vec<(SharedString, SharedString)>,
     /// Unique per layout, so the animation knows when to retarget.
     id: u64,
+    /// The chart it's laid out for (`ChartType::layout`), so a change of chart can tell it's
+    /// out of date.
+    chart: ChartType,
 }
 
 static NEXT_LAYOUT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -175,7 +204,8 @@ const SETTLE_FADE: Duration = Duration::from_millis(600);
 const BANNER_TIME: Duration = Duration::from_secs(8);
 
 impl LiveView {
-    fn new(snapshot: live::LiveSnapshot) -> Self {
+    /// Lay out `snapshot` for `chart`.
+    fn new(snapshot: live::LiveSnapshot, chart: ChartType) -> Self {
         let live::LiveSnapshot { tree, done, settled } = snapshot;
         let pending = tree.nodes[Tree::ROOT]
             .children
@@ -199,13 +229,14 @@ impl LiveView {
             keys: Vec::new(),
             labels: Vec::new(),
             id: 0,
+            chart,
         };
         view.lay_out();
         view
     }
 
     fn lay_out(&mut self) {
-        let segments = sunburst::layout(&self.tree, Tree::ROOT);
+        let segments = self.chart.layout(&self.tree, Tree::ROOT);
         self.swatches = segments
             .iter()
             .filter_map(|s| match s.target {
@@ -373,8 +404,9 @@ impl Results {
         results
     }
 
+    /// Lay the chart out again, as deep as its type shows, with everything aligned with it.
     fn relayout(&mut self) {
-        let segments = sunburst::layout(&self.tree, self.focus);
+        let segments = self.chart.layout(&self.tree, self.focus);
         if self.color_by == ColorBy::Kind {
             for s in &segments {
                 if let Target::Node(ix) = s.target {
@@ -802,15 +834,14 @@ impl Petal {
             loop {
                 let scanning = this.update(cx, |this, cx| {
                     cx.notify();
+                    let chart = this.chart;
                     let Screen::Scanning(scanning) = &mut this.screen else { return false };
                     let items = scanning.progress.files.load(Ordering::Relaxed) + scanning.progress.dirs.load(Ordering::Relaxed);
                     scanning.eta.update(clock::since(scanning.started).as_secs_f64(), items);
-                    if scanning.live.is_none() || clock::since(scanning.last_snapshot) >= LIVE_REFRESH {
-                        let layout = scanning.progress.layout.get().map(|l| &**l);
-                        let root = layout.map(|l| l.data_root.clone()).unwrap_or_else(|| scanning.root.clone());
-                        let snapshot = live::snapshot(&scanning.progress.live, &root, layout);
-                        scanning.live = Some(Rc::new(LiveView::new(snapshot)));
-                        scanning.last_snapshot = clock::now();
+                    // One laid out for a different chart is redone straight away, not on the next refresh.
+                    let stale = scanning.live.as_ref().is_none_or(|live| live.chart != chart);
+                    if stale || clock::since(scanning.last_snapshot) >= LIVE_REFRESH {
+                        scanning.snapshot(chart);
                     }
                     true
                 });
@@ -1099,13 +1130,18 @@ impl Petal {
         }
         self.chart = chart;
         cx.set_menus(crate::menus(chart));
-        // Start the chart afresh, so it's revealed the way a new chart is rather than
+        // Lay it out again straight away (the treemap is one level deep, the others several),
+        // and start the chart afresh, so it's revealed the way a new chart is rather than
         // morphing from a different shape.
         let (motion, tiles) = match &mut self.screen {
-            Screen::Scanning(scanning) => (&scanning.motion, &scanning.tiles),
+            Screen::Scanning(scanning) => {
+                scanning.snapshot(chart);
+                (&scanning.motion, &scanning.tiles)
+            }
             Screen::Results(r) => {
                 r.chart = chart;
                 r.chart_hover = None;
+                r.relayout();
                 (&r.motion, &r.tiles)
             }
             Screen::Start(_) => return cx.notify(),
@@ -2535,7 +2571,7 @@ struct ChartMotions<'a> {
 enum ChartHits {
     Rings(Geometry),
     /// The treemap's tiles, and its focus bar.
-    Tiles(Vec<treemap::Tile>, Bounds<Pixels>),
+    Tiles(Vec<Option<Bounds<Pixels>>>, Bounds<Pixels>),
 }
 
 impl ChartHits {
@@ -2717,7 +2753,7 @@ fn chart_toggle(current: ChartType, caption: bool, cx: &mut Context<Petal>) -> i
     toggle(caption.then_some("Chart"))
         .child(option("chart-sunburst", "Sunburst", "Rings round the folder (⌘1)", ChartType::Sunburst, cx))
         .child(option("chart-icicle", "Icicle", "Columns, one per level, with names (⌘2)", ChartType::Icicle, cx))
-        .child(option("chart-treemap", "Treemap", "Nested boxes sized by space (⌘3)", ChartType::Treemap, cx))
+        .child(option("chart-treemap", "Treemap", "Boxes sized by space, one level at a time (⌘3)", ChartType::Treemap, cx))
 }
 
 /// Which colour means which kind, for the kinds in view. Hover a kind to highlight it.

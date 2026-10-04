@@ -45,12 +45,21 @@ impl Segment {
 }
 
 pub fn layout(tree: &Tree, focus: usize) -> Vec<Segment> {
+    layout_to(tree, focus, MAX_DEPTH)
+}
+
+/// `layout`, only `max_depth` rings deep: the treemap shows just the focus folder's own
+/// contents, so it has no use for anything further in (and laying it out would be wasted).
+/// The segments that are there are exactly `layout`'s, so they're coloured and keyed alike.
+pub fn layout_to(tree: &Tree, focus: usize, max_depth: usize) -> Vec<Segment> {
     let mut out = Vec::new();
-    layout_children(tree, focus, 1, 0.0, 1.0, &mut out);
+    if max_depth > 0 {
+        layout_children(tree, focus, 1, max_depth, 0.0, 1.0, &mut out);
+    }
     out
 }
 
-fn layout_children(tree: &Tree, ix: usize, depth: usize, start: f32, end: f32, out: &mut Vec<Segment>) {
+fn layout_children(tree: &Tree, ix: usize, depth: usize, max_depth: usize, start: f32, end: f32, out: &mut Vec<Segment>) {
     let node = &tree.nodes[ix];
     if node.size == 0 {
         return;
@@ -86,8 +95,8 @@ fn layout_children(tree: &Tree, ix: usize, depth: usize, start: f32, end: f32, o
             end: angle + width,
             kind: child.kind,
         });
-        if child.kind == Kind::Dir && depth < MAX_DEPTH {
-            layout_children(tree, child_ix, depth + 1, angle, angle + width, out);
+        if child.kind == Kind::Dir && depth < max_depth {
+            layout_children(tree, child_ix, depth + 1, max_depth, angle, angle + width, out);
         }
         angle += width;
     }
@@ -655,6 +664,29 @@ mod tests {
 
         let (start, end, ring) = frame_of(&tree, Tree::ROOT, 5).unwrap();
         assert!((start - last.start).abs() < 1e-4 && (end - last.end).abs() < 1e-4 && ring == 1.0);
+    }
+
+    /// Cut short at one level, the layout is `layout`'s top level, segment for segment.
+    #[test]
+    fn a_depth_limited_layout_is_the_top_of_the_full_one() {
+        // root ── a (a1, a2), b, c (c1)
+        let nodes = vec![
+            node("root", 100, Kind::Dir, None, vec![1, 4, 5]),
+            node("a", 60, Kind::Dir, Some(0), vec![2, 3]),
+            node("a1", 40, Kind::File, Some(1), Vec::new()),
+            node("a2", 20, Kind::File, Some(1), Vec::new()),
+            node("b", 25, Kind::File, Some(0), Vec::new()),
+            node("c", 15, Kind::Dir, Some(0), vec![6]),
+            node("c1", 15, Kind::File, Some(5), Vec::new()),
+        ];
+        let tree = Tree { root_path: PathBuf::from("/"), nodes, errors: 0, cloud_only: 0 };
+        let full = layout(&tree, Tree::ROOT);
+        let top = layout_to(&tree, Tree::ROOT, 1);
+        let full_top: Vec<_> = full.iter().filter(|s| s.depth == 1).map(|s| (s.target, s.start, s.end)).collect();
+        assert_eq!(top.iter().map(|s| (s.target, s.start, s.end)).collect::<Vec<_>>(), full_top);
+        assert!(full.len() > top.len() && top.iter().all(|s| s.depth == 1));
+        assert_eq!(layout_to(&tree, Tree::ROOT, 2).len(), full.len(), "two levels is all this tree has");
+        assert!(layout_to(&tree, Tree::ROOT, 0).is_empty());
     }
 
     fn bounds() -> Bounds<Pixels> {
