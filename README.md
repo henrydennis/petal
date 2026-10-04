@@ -64,6 +64,8 @@ big folders are safe to clear, and tells you exactly how much deleting them will
 | **Results.** Findings, folder list and the full chart. | **Scanning.** Final folders in colour, the rest still counting. |
 | ![Zoomed into Library, hovering Caches](docs/zoom.png) | ![Collector with two items](docs/collector.png) |
 | **Explore.** Click a slice to zoom in; hover for sizes. | **Collector.** What deleting your selection frees, exactly. |
+| ![The same folder as an icicle](docs/icicle.png) | ![The same folder as a treemap, hovering Library](docs/treemap.png) |
+| **Icicle.** One row per level, falling from the folder, with names on the bars. | **Treemap.** The folder's contents as boxes sized by space; click one to go inside. |
 
 <p align="center"><img src="docs/live-scan.gif" width="720" alt="A live scan, slowed down 8×"><br><sub>A real scan of a sample home folder, slowed down 8×.</sub></p>
 
