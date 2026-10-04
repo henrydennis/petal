@@ -76,7 +76,7 @@ big folders are safe to clear, and tells you exactly how much deleting them will
 
 ### Download
 
-**[Download Petal 0.4.0 (DMG, 5.5 MB)](https://github.com/henrydennis/petal/releases/latest/download/Petal-0.4.0.dmg)** for Macs
+**[Download Petal 0.4.1 (DMG, 5.5 MB)](https://github.com/henrydennis/petal/releases/latest/download/Petal-0.4.1.dmg)** for Macs
 with Apple silicon (M1 or later) running macOS 13 or later.
 
 1. Open the DMG and drag **Petal** into **Applications**.
