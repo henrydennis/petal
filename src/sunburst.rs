@@ -373,13 +373,22 @@ impl Geometry {
         (x1 > x0 && y1 > y0).then_some((x0, y0, x1, y1))
     }
 
+    /// The part of an icicle bar that's actually painted: the bar cut off at the chart's
+    /// bottom edge. A band leaving past the last row (`band_at`) squeezes into that edge as
+    /// it fades, as one entering the first row does at the top, rather than sliding down
+    /// over the legend under the chart, which nothing else clips. Labels still fit the
+    /// whole bar (`icicle_bar`) and are clipped to the chart area.
+    fn icicle_drawn(&self, r0: f32, r1: f32, start: f32, end: f32) -> Option<(f32, f32, f32, f32)> {
+        self.icicle_bar(r0, r1.min(self.outer_radius()), start, end)
+    }
+
     /// Paint a band between two radii and two angles, leaving a hairline gap around it: an
     /// annular sector, or a bar of the icicle.
     pub fn paint_band(&self, window: &mut Window, r0: f32, r1: f32, start: f32, end: f32, color: Hsla) {
         match self.shape {
             Shape::Sunburst { center } => Self::paint_arc(window, center, r0, r1, start, end, color),
             Shape::Icicle { .. } => {
-                if let Some((x0, y0, x1, y1)) = self.icicle_bar(r0, r1, start, end) {
+                if let Some((x0, y0, x1, y1)) = self.icicle_drawn(r0, r1, start, end) {
                     paint_rect(window, rect(x0, y0, x1, y1), 2.0, color);
                 }
             }
@@ -747,6 +756,26 @@ mod tests {
         assert!((gone - g.outer_radius()).abs() < 1e-3, "just below the bottom: {gone}");
         let (higher, lower) = (g.band_at(1.5), g.band_at(2.0));
         assert!(higher.0 < lower.0 && higher.1 < lower.1, "deeper is lower down");
+    }
+
+    /// A band falling off the bottom is cut off at the chart's bottom edge as it fades, so it
+    /// never paints over the legend under the chart; in the rows it's the whole bar.
+    #[test]
+    fn icicle_bands_leaving_the_last_row_stay_inside_the_chart() {
+        let g = Geometry::icicle(bounds());
+        let bottom = g.outer_radius() - GAP_PX / 2.0;
+        for step in 0..=20 {
+            let depth = MAX_DEPTH as f32 + step as f32 / 20.0;
+            let (r0, r1, _) = g.band_at(depth);
+            if let Some((_, y0, _, y1)) = g.icicle_drawn(r0, r1, 0.2, 0.7) {
+                assert!(y0 < y1 && y1 <= bottom + 1e-3, "at depth {depth}: {y0}..{y1}, bottom {bottom}");
+            }
+        }
+        assert_eq!(g.icicle_drawn(g.outer_radius(), g.outer_radius() + 50.0, 0.2, 0.7), None, "all the way off, nothing's left");
+        for depth in 1..=MAX_DEPTH {
+            let (r0, r1) = g.rings[depth - 1];
+            assert_eq!(g.icicle_drawn(r0, r1, 0.2, 0.7), g.icicle_bar(r0, r1, 0.2, 0.7));
+        }
     }
 
     #[test]
