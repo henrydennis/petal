@@ -51,8 +51,13 @@ big folders are safe to clear, and tells you exactly how much deleting them will
 - **Savings you can trust.** On APFS, deleting a cloned or hard-linked file may free nothing. Petal
   works out what deleting your selection *really* frees, counting clones and hard links once, and
   this is tested against real deletions on a throwaway APFS volume.
+- **Snapshots and purgeable space.** On the startup disk Petal lists the APFS snapshots that keep
+  deleted files' space in use, and can delete Time Machine's (macOS asks for your password). It also
+  shows how much space is *purgeable*, meaning macOS frees it by itself when it needs room.
 - **Collect, then clean up.** Drag folders (or press **+**) into the Collector, check the total, and
   move them to the Trash in one go. Nothing is deleted outright; you can put things back from the Trash.
+- **Reads protected folders too.** Folders that belong to macOS or other users can be read as an
+  administrator. Only those folders are read again, and their sizes slot into the results without a rescan.
 - **Safe by design.** Petal only reads file metadata. It never downloads iCloud files that are only in
   the cloud, never sends anything over the network, and has no analytics.
 
@@ -131,6 +136,28 @@ in Petal notices within a couple of seconds and offers to rescan.
 
 When you run Petal from a terminal (`cargo run`), macOS asks about the terminal app instead of Petal.
 
+### Folders that belong to macOS or other users
+
+Some folders can't be read even with Full Disk Access: other users' home folders, and parts of
+`/Library` and `/private/var` that belong to macOS. Choose **File › Read Protected Folders as
+Administrator…** (or click the button on the card Petal shows) and macOS asks for an administrator's
+password. Petal then reads just those folders and updates the results in place. Petal itself never runs
+as root. It starts a one-off copy of itself with administrator rights, which reads names and sizes,
+sends them back and exits. A few folders stay private even to administrators.
+
+### Snapshots and purgeable space
+
+APFS snapshots are frozen copies of a volume. While a snapshot exists, deleting a file doesn't free its
+space. Petal lists the startup disk's snapshots with their dates. APFS doesn't report how much space
+each one holds, so when there are snapshots the slice for what Petal couldn't read is called
+**Snapshots and unreadable**. Time Machine's local snapshots (a day's worth of quick undo; your backups
+are elsewhere) can be deleted from the snapshots card, and Petal then tells you how much that freed.
+Snapshots from macOS updates and other apps are left to whatever made them.
+
+*Purgeable* space is space macOS frees by itself when it runs short, such as Time Machine snapshots,
+iCloud files it can download again, and some caches. Petal shows it on the Disks screen and at the top of
+the results. It's already included in the chart's sizes.
+
 ## Using Petal
 
 The first time you open Petal it starts scanning your startup disk straight away. After that it opens
@@ -146,6 +173,8 @@ on the **Disks** screen, with your volumes, **Scan Home Folder** and **Choose Fo
 - In the list, **⌕** reveals an item in Finder and **+** adds it to the Collector.
 - **Move to Trash…** asks for confirmation, moves the collected items to the Trash, and updates every
   total in place without rescanning.
+- **File › Read Protected Folders as Administrator…** reads the folders that couldn't be read, after
+  asking for an administrator's password.
 
 | Keys | Action |
 |---|---|
@@ -167,7 +196,8 @@ src/
 ├── scan.rs        parallel walk (outline → hotspots → depth-first), the flat Tree, volumes, frees_of
 ├── dirlist.rs     getattrlistbulk/openat directory listing, with a portable fallback
 ├── live.rs        live per-folder totals during a scan, snapshots, and the live-chart benchmark
-├── disk.rs        the startup disk's APFS container: exact slices for the other volumes
+├── disk.rs        the startup disk's APFS container: exact slices for the other volumes, snapshots, purgeable space
+├── admin.rs       reading protected folders and deleting snapshots, through a one-off administrator helper
 ├── findings.rs    the catalog of known space hogs and how to recognise them
 ├── sunburst.rs    layout in angle space; sunburst and icicle painting, hit-testing and labels; colours
 ├── treemap.rs     a folder's contents as squarified boxes, with their own motion and labels

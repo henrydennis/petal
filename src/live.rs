@@ -98,7 +98,7 @@ pub fn snapshot(live: &LiveNode, root_path: &Path, layout: Option<&DiskLayout>) 
         // Added after the folders, with the remainder last, so the order holds still too.
         nodes[Tree::ROOT].name = layout.name.clone().into();
     }
-    LiveSnapshot { tree: Tree { root_path: root_path.to_path_buf(), nodes, errors: 0, cloud_only: 0 }, done, settled }
+    LiveSnapshot { tree: Tree { root_path: root_path.to_path_buf(), nodes, errors: 0, cloud_only: 0, ..Default::default() }, done, settled }
 }
 
 /// The live totals as a tree, plus which folders are final and since when (indexed like

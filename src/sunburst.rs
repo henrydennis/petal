@@ -655,7 +655,7 @@ mod tests {
             total += size;
         }
         nodes[0].size = total;
-        let tree = Tree { root_path: PathBuf::from("/"), nodes, errors: 0, cloud_only: 0 };
+        let tree = Tree { root_path: PathBuf::from("/"), nodes, errors: 0, cloud_only: 0, ..Default::default() };
         let segments = layout(&tree, Tree::ROOT);
         let targets: Vec<Target> = segments.iter().map(|s| s.target).collect();
         assert!(targets.contains(&Target::Node(5)), "the large last slice has its own segment: {targets:?}");
@@ -679,7 +679,7 @@ mod tests {
             node("c", 15, Kind::Dir, Some(0), vec![6]),
             node("c1", 15, Kind::File, Some(5), Vec::new()),
         ];
-        let tree = Tree { root_path: PathBuf::from("/"), nodes, errors: 0, cloud_only: 0 };
+        let tree = Tree { root_path: PathBuf::from("/"), nodes, errors: 0, cloud_only: 0, ..Default::default() };
         let full = layout(&tree, Tree::ROOT);
         let top = layout_to(&tree, Tree::ROOT, 1);
         let full_top: Vec<_> = full.iter().filter(|s| s.depth == 1).map(|s| (s.target, s.start, s.end)).collect();
