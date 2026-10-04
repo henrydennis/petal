@@ -29,7 +29,7 @@ use gpui::{App, Bounds, ContentMask, Font, FontWeight, Hsla, Pixels, Point, Shar
 
 use crate::motion::{Key, Spring, smootherstep};
 use crate::scan::{Kind, Tree};
-use crate::sunburst::{Hit, Segment, fit_line, label_color};
+use crate::sunburst::{Hit, MIN_TURNS, Segment, fit_line, label_color};
 
 /// Room above the chart for the app's hover label strip.
 const TOP_MARGIN: f32 = 52.0;
@@ -163,17 +163,17 @@ fn squarify(weights: &[f64], whole: f64, rect: Rect) -> Vec<Rect> {
     out
 }
 
-/// A folder filled this much by one folder inside it shows as just that one box, as if
-/// clicking it had only made the box bigger. Such chains are everywhere (an app's `Contents`,
-/// a crate's `src`, a build's `target/release`), so the treemap opens and leaves them as one.
-const FILLED: f64 = 0.99;
-
-/// The folder inside `ix` that fills it (`FILLED`), if one does.
+/// The folder inside `ix` that fills it, if one does: one so nearly all of it that everything
+/// else together is too thin to get a box of its own (`sunburst::layout` merges it into a
+/// sliver, and drops a sliver thinner than half its usual cut-off). Such a folder shows as
+/// that one box, as if clicking it had only made the box bigger. Chains of them are
+/// everywhere (an app's `Contents`, a crate's `src`, a build's `target/release`), so the
+/// treemap opens and leaves them as one.
 fn filled_by(tree: &Tree, ix: usize) -> Option<usize> {
     let node = &tree.nodes[ix];
     let &inner = node.children.iter().max_by_key(|&&c| tree.nodes[c].size)?;
-    let size = tree.nodes[inner].size as f64;
-    (tree.nodes[inner].kind == Kind::Dir && node.size > 0 && size >= node.size as f64 * FILLED).then_some(inner)
+    let rest = node.size.saturating_sub(tree.nodes[inner].size) as f64;
+    (tree.nodes[inner].kind == Kind::Dir && node.size > 0 && rest < node.size as f64 * (MIN_TURNS / 2.0) as f64).then_some(inner)
 }
 
 /// Where opening the folder `ix` goes: into it, and on through any folder that one folder
@@ -185,12 +185,14 @@ pub fn opened(tree: &Tree, mut ix: usize) -> usize {
     ix
 }
 
-/// Where going up from `focus` goes: its folder, or, past any folder that one folder fills
-/// (which would show just a box leading back down), the first that shows more than one.
+/// Where going up from `focus` goes: its folder, or, past any folder filled by the one on the
+/// way back down (which would show just a box leading back there), the first that shows more.
+/// A folder filled by something else stays: it's where `focus` gets a box, or a row in the list.
 pub fn enclosing(tree: &Tree, focus: usize) -> Option<usize> {
-    let mut up = tree.nodes[focus].parent?;
-    while let (Some(_), Some(parent)) = (filled_by(tree, up), tree.nodes[up].parent) {
-        up = parent;
+    let (mut below, mut up) = (focus, tree.nodes[focus].parent?);
+    while filled_by(tree, up) == Some(below) {
+        let Some(parent) = tree.nodes[up].parent else { break };
+        (below, up) = (up, parent);
     }
     Some(up)
 }
@@ -852,7 +854,8 @@ mod tests {
 
     /// root ── crate (60) ── src (59.9) ── win (59.9) ── x (30), y (29.9)
     ///     │                └ Cargo.toml (0.1)
-    ///     ├ docs (39) ── guide (38.4), notes (0.6)
+    ///     ├ docs (38) ── guide (37.4), notes (0.6)
+    ///     ├ build (80) ── release (79.9), stray (0.1)
     ///     └ empty (1)
     fn chains() -> Tree {
         let mut nodes = Vec::new();
@@ -871,27 +874,32 @@ mod tests {
         let win = add("win", 599, Kind::Dir, Some(src));
         add("x", 300, Kind::Dir, Some(win));
         add("y", 299, Kind::Dir, Some(win));
-        let docs = add("docs", 390, Kind::Dir, Some(root));
-        add("guide", 384, Kind::Dir, Some(docs));
+        let docs = add("docs", 380, Kind::Dir, Some(root));
+        add("guide", 374, Kind::Dir, Some(docs));
         add("notes", 6, Kind::File, Some(docs));
+        let build = add("build", 800, Kind::Dir, Some(root));
+        add("release", 799, Kind::Dir, Some(build));
+        add("stray", 1, Kind::Dir, Some(build));
         add("empty", 10, Kind::Dir, Some(root));
         Tree { root_path: PathBuf::from("/"), nodes, errors: 0, cloud_only: 0 }
     }
 
-    /// Opening a folder one folder fills goes on into it, as far as the chain goes; a folder
-    /// with a real second box (here 1.5%), or nothing inside, opens as it is.
+    /// Opening a folder one folder fills goes on into it, as far as the chain goes. A folder
+    /// with anything else big enough to get a box (here 1.6%), or nothing inside, opens as it is.
     #[test]
     fn opening_goes_through_folders_one_folder_fills() {
         let tree = chains();
         let name = |ix: usize| tree.nodes[ix].name.to_string();
         assert_eq!(name(opened(&tree, 1)), "win", "crate → src → win");
-        assert_eq!(name(opened(&tree, 7)), "docs", "guide is only 98.5% of docs");
-        assert_eq!(name(opened(&tree, 10)), "empty");
+        assert_eq!(name(opened(&tree, 7)), "docs", "notes gets a box beside guide");
+        assert_eq!(name(opened(&tree, 10)), "release", "stray is too thin to draw");
+        assert_eq!(name(opened(&tree, 13)), "empty");
         assert_eq!(name(opened(&tree, 4)), "win", "already there");
     }
 
     /// Going up skips the same chains on the way back, to the first folder showing more than
-    /// one box; it stops at the top whatever the top holds.
+    /// one box, and stops at the top whatever it holds. A folder filled by something other
+    /// than the way back isn't skipped: it's where the folder you leave is (in the list, at least).
     #[test]
     fn going_up_skips_folders_one_folder_fills() {
         let tree = chains();
@@ -899,6 +907,8 @@ mod tests {
         assert_eq!(name(enclosing(&tree, 4)), Some("root".into()), "win → past src and crate → root");
         assert_eq!(name(enclosing(&tree, 5)), Some("win".into()), "x → win, which holds two boxes");
         assert_eq!(name(enclosing(&tree, 8)), Some("docs".into()));
+        assert_eq!(name(enclosing(&tree, 11)), Some("root".into()), "release → past build");
+        assert_eq!(name(enclosing(&tree, 12)), Some("build".into()), "stray → build, which release fills, not stray");
         assert_eq!(name(enclosing(&tree, 0)), None, "nothing above the top");
     }
 

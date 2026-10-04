@@ -16,7 +16,7 @@ use crate::scan::{Kind, Tree};
 
 pub const MAX_DEPTH: usize = 6;
 /// Children thinner than this are merged into a single "smaller objects" segment.
-const MIN_TURNS: f32 = 0.004;
+pub(crate) const MIN_TURNS: f32 = 0.004;
 const RING_FALLOFF: f32 = 0.84;
 const GAP_PX: f32 = 1.2;
 
