@@ -2369,14 +2369,13 @@ impl Petal {
                 };
                 (node.name.clone(), format!("{}\n{detail}{kind}", format_size(node.size)))
             }
-            Some(Target::Small { parent, .. }) => {
-                let seg_size: u64 = tree.nodes[parent]
-                    .children
-                    .iter()
-                    .map(|&c| tree.nodes[c].size)
-                    .filter(|&s| (s as f32) < tree.nodes[parent].size as f32 * 0.004)
-                    .sum();
-                ("Smaller objects".into(), format_size(seg_size))
+            // Only the chart has these, and its label already says how big the run is.
+            Some(Target::Small { .. }) => {
+                let size = match r.chart_hover {
+                    Some(Hit::Segment(i)) => r.labels.get(i).map(|(_, size)| size.to_string()),
+                    _ => None,
+                };
+                ("Smaller objects".into(), size.unwrap_or_default())
             }
             None if center_hovered => ("↑ Back".into(), format!("to “{}”", tree.nodes[tree.nodes[r.focus].parent.unwrap()].name)),
             None => {
@@ -2477,8 +2476,11 @@ impl Petal {
                 } else {
                     String::new()
                 };
+                // Over the sunburst it's centred above the circle; the icicle and treemap keep their
+                // label strip along the top, so it goes to the right of that.
+                let place = |d: gpui::Div| if chart_type == ChartType::Sunburst { d.top_4().left_0().right_0().justify_center() } else { d.top_2().right_4() };
                 d.child(
-                    div().absolute().top_4().left_0().right_0().flex().justify_center().child(
+                    place(div().absolute().flex()).child(
                         div()
                             .id("done-banner")
                             .px_4()
