@@ -22,6 +22,7 @@ use crate::disk;
 use crate::eta;
 use crate::onboarding;
 use crate::findings::{self, Finding, Fix, Safety};
+use crate::icons;
 use crate::live;
 use crate::motion;
 use crate::scan::{self, Kind, Progress, Tree, Volume, format_count, format_size};
@@ -64,8 +65,8 @@ enum ColorBy {
 pub enum ChartType {
     /// Rings round the folder in focus.
     Sunburst,
-    /// The sunburst unrolled into columns, one per level, with room for names along each bar
-    /// (see `Geometry::icicle`).
+    /// The sunburst unrolled into rows falling from the folder in focus, one per level, with
+    /// room for names along each bar (see `Geometry::icicle`).
     Icicle,
     /// Boxes sized by area (see `treemap`), one for each thing in the folder in focus; click
     /// a folder's box to zoom into it.
@@ -74,8 +75,8 @@ pub enum ChartType {
 
 impl ChartType {
     /// The chart's segments for the folder `focus`: as many levels as the sunburst and icicle
-    /// show, and just the one for the treemap, which shows one level at a time. Keys, labels, swatches and categories are all made from these, so they line up
-    /// whichever it is.
+    /// show, and just the one for the treemap, which shows one level at a time. Keys, labels,
+    /// swatches and categories are all made from these, so they line up whichever it is.
     fn layout(self, tree: &Tree, focus: usize) -> Vec<Segment> {
         match self {
             ChartType::Sunburst | ChartType::Icicle => sunburst::layout(tree, focus),
@@ -2604,7 +2605,7 @@ fn paint_treemap_backdrop(area: Bounds<Pixels>, window: &mut Window) {
 /// Move the chart on a frame and paint it, as whichever type it is: what the scan's and the
 /// results' canvases share. `fraction` is the share of the chart scanned so far, with
 /// `pending` the colour of the rest; `center` colours what stands for the folder in focus and
-/// takes you up a level (the sunburst's centre, the icicle's first column, the treemap's focus
+/// takes you up a level (the sunburst's centre, the icicle's bar along the top, the treemap's focus
 /// bar), and `focus` titles the treemap's focus bar (name, size). `color` is as for
 /// `ChartMotion::paint`.
 #[allow(clippy::too_many_arguments)]
@@ -2702,10 +2703,13 @@ fn chart_label(chart: ChartType, max_width: f32, title: SharedString, lines: Vec
     )
 }
 
-/// One choice in a toolbar toggle ("Colour: Folder | Kind").
-fn toggle_option(id: &'static str, label: &'static str, selected: bool) -> Stateful<gpui::Div> {
+/// One choice in a toolbar toggle ("Colour: Folder | Kind"), to put its label (and icon) in.
+fn toggle_option(id: &'static str, selected: bool) -> Stateful<gpui::Div> {
     div()
         .id(id)
+        .flex()
+        .items_center()
+        .gap_1()
         .px_2()
         .py_0p5()
         .rounded_md()
@@ -2713,7 +2717,6 @@ fn toggle_option(id: &'static str, label: &'static str, selected: bool) -> State
         .when(selected, |d| d.bg(rgb(CARD_HOVER)).text_color(rgb(TEXT)))
         .when(!selected, |d| d.text_color(rgb(MUTED)).hover(|s| s.text_color(rgb(TEXT))))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .child(label)
 }
 
 /// A row of `toggle_option`s, with its caption when there's room.
@@ -2734,20 +2737,25 @@ fn toggle(caption: Option<&'static str>) -> gpui::Div {
 /// "Colour: Folder | Kind" in the toolbar.
 fn color_toggle(current: ColorBy, caption: bool, cx: &mut Context<Petal>) -> impl IntoElement {
     let option = |id, label, value: ColorBy, cx: &mut Context<Petal>| {
-        toggle_option(id, label, current == value).on_click(cx.listener(move |this, _, _, cx| this.set_color_by(value, cx)))
+        toggle_option(id, current == value).child(label).on_click(cx.listener(move |this, _, _, cx| this.set_color_by(value, cx)))
     };
     toggle(caption.then_some("Colour")).child(option("color-folder", "Folder", ColorBy::Folder, cx)).child(option("color-kind", "Kind", ColorBy::Kind, cx))
 }
 
-/// "Chart: Sunburst | Icicle | Treemap" in the toolbar.
+/// "Chart: Sunburst | Icicle | Treemap" in the toolbar, each with a picture of the chart. In a
+/// narrow window (no `caption`) the pictures go on alone, and the tooltips name them.
 fn chart_toggle(current: ChartType, caption: bool, cx: &mut Context<Petal>) -> impl IntoElement {
     let option = |id, label, hint, value: ChartType, cx: &mut Context<Petal>| {
-        toggle_option(id, label, current == value).tooltip(tooltip(hint)).on_click(cx.listener(move |this, _, _, cx| this.set_chart(value, cx)))
+        toggle_option(id, current == value)
+            .child(icons::chart(value))
+            .when(caption, |d| d.child(label))
+            .tooltip(tooltip(hint))
+            .on_click(cx.listener(move |this, _, _, cx| this.set_chart(value, cx)))
     };
     toggle(caption.then_some("Chart"))
-        .child(option("chart-sunburst", "Sunburst", "Rings round the folder (⌘1)", ChartType::Sunburst, cx))
-        .child(option("chart-icicle", "Icicle", "Columns, one per level, with names (⌘2)", ChartType::Icicle, cx))
-        .child(option("chart-treemap", "Treemap", "Boxes sized by space, one level at a time (⌘3)", ChartType::Treemap, cx))
+        .child(option("chart-sunburst", "Sunburst", "Sunburst: rings round the folder (⌘1)", ChartType::Sunburst, cx))
+        .child(option("chart-icicle", "Icicle", "Icicle: rows falling from the folder, with names (⌘2)", ChartType::Icicle, cx))
+        .child(option("chart-treemap", "Treemap", "Treemap: boxes sized by space, one level at a time (⌘3)", ChartType::Treemap, cx))
 }
 
 /// Which colour means which kind, for the kinds in view. Hover a kind to highlight it.

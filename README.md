@@ -26,8 +26,8 @@
 
 Petal shows your disk as a sunburst: the centre is the folder you're looking at, each ring is one
 level deeper, and the size of a slice is how much space it takes. Prefer bars or boxes? The same
-picture also comes as an icicle or a treemap. It draws the picture *while* it reads, tells you which big folders are safe to clear, and tells you exactly how much deleting them
-will free.
+picture also comes as an icicle or a treemap. It draws the picture *while* it reads, tells you which
+big folders are safe to clear, and tells you exactly how much deleting them will free.
 
 ## Highlights
 

@@ -5,6 +5,7 @@ mod dirlist;
 mod disk;
 mod eta;
 mod findings;
+mod icons;
 mod live;
 mod motion;
 mod onboarding;
