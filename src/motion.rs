@@ -26,7 +26,7 @@ use std::time::Instant;
 use gpui::{Hsla, SharedString, Window, hsla};
 
 use crate::scan::Tree;
-use crate::sunburst::{self, Geometry, Painted, Segment};
+use crate::sunburst::{self, Band, Geometry, Painted, Segment};
 
 /// A segment's identity across layouts.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -172,18 +172,6 @@ struct Piece {
     depth: f32,
     color: Hsla,
     group: usize,
-}
-
-/// One band as it's drawn this frame (see `ChartMotion::bands`).
-#[derive(Clone, Copy, Debug)]
-struct Band {
-    r0: f32,
-    r1: f32,
-    start: f32,
-    end: f32,
-    /// With `alpha` applied.
-    color: Hsla,
-    alpha: f32,
 }
 
 /// The scan's chart folding away and the results opening (see `ChartMotion::fold`).
@@ -613,10 +601,10 @@ impl ChartMotion {
     /// its current angles (so hues can follow the motion).
     pub fn paint(&mut self, window: &mut Window, geometry: &Geometry, color: impl FnMut(usize, f32, f32) -> Hsla) -> Vec<Painted> {
         let mut painted = Vec::new();
-        for (band, index) in self.bands(geometry, color) {
-            geometry.paint_band(window, band.r0, band.r1, band.start, band.end, band.color);
+        for (index, band) in self.bands(geometry, color) {
+            geometry.paint_band(window, band.r0, band.reach, band.start, band.end, band.drawn_color());
             if let Some(index) = index {
-                painted.push(Painted { index, r0: band.r0, r1: band.r1, start: band.start, end: band.end, alpha: band.alpha });
+                painted.push(Painted { index, band });
             }
         }
         painted
@@ -625,7 +613,7 @@ impl ChartMotion {
     /// Everything to draw this frame, bottom first, each with its index in the latest
     /// layout if it's part of it: the scan's chart folding away, then the segments, outer
     /// rings first.
-    fn bands(&mut self, geometry: &Geometry, mut color: impl FnMut(usize, f32, f32) -> Hsla) -> Vec<(Band, Option<usize>)> {
+    fn bands(&mut self, geometry: &Geometry, mut color: impl FnMut(usize, f32, f32) -> Hsla) -> Vec<(Option<usize>, Band)> {
         let fraction = self.fraction.x;
         // The first chart is uncovered from the centre outward.
         let reach = match self.reveal {
@@ -636,11 +624,10 @@ impl ChartMotion {
             }
             None => f32::INFINITY,
         };
-        let faded = |c: Hsla, alpha: f32| hsla(c.hue.into_positive_degrees() / 360.0, c.saturation, c.lightness, c.alpha * alpha);
         let mut bands = Vec::new();
         for piece in self.folding_away().unwrap_or_default() {
             let (r0, r1, alpha) = geometry.band_at(piece.depth);
-            bands.push((Band { r0, r1, start: piece.start, end: piece.end, color: faded(piece.color, alpha), alpha }, None));
+            bands.push((None, Band { r0, r1, reach: r1, start: piece.start, end: piece.end, color: piece.color, alpha }));
         }
         let opening = Self::opening(self.fold.as_ref());
         // Outer rings first, so a ring sliding out from under its parent stays beneath it.
@@ -660,8 +647,8 @@ impl ChartMotion {
             if alpha < 0.01 {
                 continue;
             }
-            let band = Band { r0, r1: r1.min(reach), start: start * fraction, end: end * fraction, color: faded(motion.color, alpha), alpha };
-            bands.push((band, motion.current));
+            let band = Band { r0, r1, reach: r1.min(reach), start: start * fraction, end: end * fraction, color: motion.color, alpha };
+            bands.push((motion.current, band));
         }
         bands
     }
@@ -903,7 +890,8 @@ mod tests {
     }
 
     /// What `paint` reports drawing: the latest layout's segments where they are, scaled by
-    /// the scan's fraction, and nothing on its way out.
+    /// the scan's fraction, in the colour they're painted, and nothing on its way out. While
+    /// the reveal uncovers a bar, it's still the whole bar, with how far it's uncovered.
     #[test]
     fn painting_reports_where_the_latest_layout_went() {
         let geometry = Geometry::icicle(gpui::Bounds::new(gpui::point(gpui::px(0.), gpui::px(0.)), gpui::size(gpui::px(800.), gpui::px(600.))));
@@ -912,14 +900,22 @@ mod tests {
         motion.retarget(1, &[key("a"), key("a/x"), key("b")], &[seg(0.0, 0.6, 1), seg(0.0, 0.3, 2), seg(0.6, 1.0, 1)], 0.5);
         motion.step(t);
         assert!(motion.bands(&geometry, |_, _, _| hsla(0., 0., 0.5, 1.)).is_empty(), "the reveal starts with nothing showing");
+        for _ in 0..2 {
+            t += Duration::from_millis(16);
+            motion.step(t);
+        }
+        let bands = motion.bands(&geometry, |i, _, _| hsla(i as f32 / 4.0, 0.5, 0.5, 1.));
+        let (_, a) = bands.iter().find(|(index, _)| *index == Some(0)).expect("a is coming into view");
+        assert!(a.reach < a.r1 && (a.r1 - geometry.rings[0].1).abs() < 0.1, "the whole bar, partly uncovered: {a:?}");
+        assert_eq!(a.color, hsla(0.0, 0.5, 0.5, 1.), "the colour it's painted, before its alpha");
         run(&mut motion, &mut t, |_| {});
         motion.retarget(2, &[key("a"), key("a/x")], &[seg(0.0, 1.0, 1), seg(0.0, 0.5, 2)], 0.5);
         motion.step(t);
         let bands = motion.bands(&geometry, |_, _, _| hsla(0., 0., 0.5, 1.));
-        assert_eq!(bands.iter().filter(|(_, index)| index.is_none()).count(), 1, "b, on its way out");
+        assert_eq!(bands.iter().filter(|(index, _)| index.is_none()).count(), 1, "b, on its way out");
         run(&mut motion, &mut t, |_| {});
         let mut painted: Vec<(usize, f32, f32, f32)> =
-            motion.bands(&geometry, |_, _, _| hsla(0., 0., 0.5, 1.)).into_iter().filter_map(|(b, index)| Some((index?, b.start, b.end, b.r0))).collect();
+            motion.bands(&geometry, |_, _, _| hsla(0., 0., 0.5, 1.)).into_iter().filter_map(|(index, b)| Some((index?, b.start, b.end, b.r0))).collect();
         painted.sort_by_key(|p| p.0);
         assert_eq!(painted.len(), 2);
         assert!(close(painted[0].1, 0.0) && close(painted[0].2, 0.5) && close(painted[1].2, 0.25), "{painted:?}");

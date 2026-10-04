@@ -194,18 +194,38 @@ pub enum Hit {
     Segment(usize),
 }
 
-/// A segment of the latest layout as `ChartMotion::paint` drew it this frame, so labels can
-/// go where the bars actually are.
+/// A band as `ChartMotion::paint` draws it this frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Band {
+    /// Where the whole band is, even the part the reveal hasn't uncovered yet.
+    pub r0: f32,
+    pub r1: f32,
+    /// How far out it's uncovered (the first layout's reveal): `r1` once all of it shows.
+    /// It's painted from `r0` to here.
+    pub reach: f32,
+    /// Turns, after the scan's fraction and any fold placement.
+    pub start: f32,
+    pub end: f32,
+    /// The colour it's painted, before `alpha`, so labels can contrast with exactly that.
+    pub color: Hsla,
+    pub alpha: f32,
+}
+
+impl Band {
+    /// The colour as drawn, with `alpha` applied.
+    pub fn drawn_color(&self) -> Hsla {
+        let c = self.color;
+        hsla(hue_turns(&c), c.saturation, c.lightness, c.alpha * self.alpha)
+    }
+}
+
+/// A band of the latest layout as `ChartMotion::paint` drew it, so labels can go where the
+/// bars actually are.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Painted {
     /// Index into the latest layout's segments.
     pub index: usize,
-    pub r0: f32,
-    pub r1: f32,
-    /// Turns, after the scan's fraction and any fold placement.
-    pub start: f32,
-    pub end: f32,
-    pub alpha: f32,
+    pub band: Band,
 }
 
 impl Geometry {
@@ -397,27 +417,23 @@ impl Geometry {
         }
     }
 
-    /// Everything within `radius` of the centre: a disc, or for the icicle the full height
-    /// from its left edge to `radius`.
+    /// Everything within `radius` of the centre. Sunburst only (the chart's own disc, and
+    /// `Geometry::ring` gauges): for anything that has to work for the icicle too, use
+    /// `paint_backdrop` and `paint_center`, which know what each shape needs.
     pub fn paint_disc(&self, window: &mut Window, radius: f32, color: Hsla) {
-        match self.shape {
-            Shape::Sunburst { center } => {
-                let mut builder = PathBuilder::fill();
-                let steps = 180;
-                builder.move_to(Self::at(center, radius, 0.0));
-                for i in 1..steps {
-                    builder.line_to(Self::at(center, radius, i as f32 / steps as f32));
-                }
-                builder.close();
-                if let Ok(path) = builder.build() {
-                    window.paint_path(path, color);
-                }
-            }
-            Shape::Icicle { top, bottom, left } => {
-                if radius > left {
-                    paint_rect(window, rect(left, top, radius, bottom), 0.0, color);
-                }
-            }
+        let Shape::Sunburst { center } = self.shape else {
+            debug_assert!(false, "paint_disc is for sunbursts; use paint_backdrop or paint_center");
+            return;
+        };
+        let mut builder = PathBuilder::fill();
+        let steps = 180;
+        builder.move_to(Self::at(center, radius, 0.0));
+        for i in 1..steps {
+            builder.line_to(Self::at(center, radius, i as f32 / steps as f32));
+        }
+        builder.close();
+        if let Ok(path) = builder.build() {
+            window.paint_path(path, color);
         }
     }
 
@@ -449,23 +465,31 @@ fn paint_rect(window: &mut Window, bounds: Bounds<Pixels>, radius: f32, color: H
     window.paint_quad(gpui::fill(bounds, color).corner_radii(px(if small { 0.0 } else { radius })));
 }
 
-/// Labels need this much bar, after the gaps, to be worth drawing.
-const LABEL_MIN_WIDTH: f32 = 28.0;
-const LABEL_MIN_HEIGHT: f32 = 15.0;
-/// Tall enough for the size under the name.
-const LABEL_TWO_LINES: f32 = 31.0;
 const LABEL_PAD_X: f32 = 6.0;
 const LABEL_PAD_TOP: f32 = 3.0;
 const NAME_SIZE: f32 = 12.0;
 const NAME_LINE: f32 = 15.0;
 const DETAIL_SIZE: f32 = 11.0;
 const DETAIL_LINE: f32 = 13.0;
+/// Labels need this much bar, after the gaps, to be worth drawing: room for a few letters,
+/// and for the whole name line, descenders and all, under the padding.
+const LABEL_MIN_WIDTH: f32 = 28.0;
+const LABEL_MIN_HEIGHT: f32 = LABEL_PAD_TOP + NAME_LINE;
+/// Tall enough for the size under the name.
+const LABEL_TWO_LINES: f32 = LABEL_MIN_HEIGHT + DETAIL_LINE;
 
 /// Text that reads on a bar of colour `bar`: near-white on most, near-black on light ones,
 /// faded with the bar.
 pub fn label_color(bar: Hsla, alpha: f32) -> Hsla {
     let alpha = alpha * bar.alpha;
     if bar.lightness > 0.62 { hsla(0.0, 0.0, 0.08, 0.85 * alpha) } else { hsla(0.0, 0.0, 1.0, 0.92 * alpha) }
+}
+
+/// `text` as one line: file names can hold newlines and other control characters, which
+/// the text system can't lay out on a single line (and asserts against), so they become
+/// spaces.
+fn single_line(text: &SharedString) -> SharedString {
+    if text.contains(char::is_control) { text.replace(char::is_control, " ").into() } else { text.clone() }
 }
 
 /// `text` shaped to fit in `max_width`, cut short with "…" if it doesn't; `None` if not even
@@ -475,6 +499,7 @@ pub fn fit_line(window: &Window, text: &SharedString, font: &Font, font_size: f3
     if max_width <= 0.0 || text.is_empty() {
         return None;
     }
+    let text = single_line(text);
     let shape = |text: SharedString| {
         let run = TextRun { len: text.len(), font: font.clone(), color, background_color: None, underline: None, strikethrough: None, letter_spacing: None };
         window.text_system().shape_line(text, px(font_size), &[run], None)
@@ -501,34 +526,29 @@ pub fn fit_line(window: &Window, text: &SharedString, font: &Font, font_size: f3
 }
 
 /// Names (and sizes, where there's room) on the icicle's bars, as `ChartMotion::paint` drew
-/// them. `label` gives a segment's name, size and colour. Each label is clipped to the part
-/// of its bar that's showing: not under the first column, nor under a bar painted over it
-/// (a folder's contents sliding out from under it), nor past what the reveal has uncovered.
-pub fn paint_icicle_labels(
-    geometry: &Geometry,
-    painted: &[Painted],
-    label: impl Fn(usize) -> Option<(SharedString, SharedString, Hsla)>,
-    window: &mut Window,
-    cx: &mut App,
-) {
+/// them. `label` gives a segment's name and size; the text's colour is worked out from the
+/// colour the bar was painted. Each label is placed on and fitted to its whole bar, and
+/// clipped to the part that's showing, so it's uncovered along with the bar (by the reveal,
+/// or sliding out from under its parent) rather than cut short again every frame.
+pub fn paint_icicle_labels(geometry: &Geometry, painted: &[Painted], label: impl Fn(usize) -> Option<(SharedString, SharedString)>, window: &mut Window, cx: &mut App) {
     let Some(area) = geometry.icicle_rect() else { return };
     let font = window.text_style().font();
     let name_font = Font { weight: FontWeight::MEDIUM, ..font.clone() };
     for (i, bar) in painted.iter().enumerate() {
-        if bar.alpha < 0.05 {
+        if bar.band.alpha < 0.05 {
             continue;
         }
-        let Some((x0, y0, x1, y1)) = visible_bar(geometry, painted, i) else { continue };
-        let Some((name, detail, color)) = label(bar.index) else { continue };
-        let text = label_color(color, bar.alpha);
-        let width = x1 - x0 - LABEL_PAD_X * 2.0;
-        let origin = point(px(x0 + LABEL_PAD_X), px(y0 + LABEL_PAD_TOP));
-        let clip = ContentMask { bounds: rect(x0, y0, x1, y1).intersect(&area) };
+        let Some(spot) = label_spot(geometry, painted, i) else { continue };
+        let Some((name, detail)) = label(bar.index) else { continue };
+        let text = label_color(bar.band.color, bar.band.alpha);
+        let width = spot.x1 - spot.x0 - LABEL_PAD_X * 2.0;
+        let origin = point(px(spot.x0 + LABEL_PAD_X), px(spot.y0 + LABEL_PAD_TOP));
+        let clip = ContentMask { bounds: rect(spot.shown.0, spot.y0, spot.shown.1, spot.y1).intersect(&area) };
         window.with_content_mask(Some(clip), |window| {
             if let Some(line) = fit_line(window, &name, &name_font, NAME_SIZE, text, width) {
                 line.paint(origin, px(NAME_LINE), TextAlign::Left, None, window, cx).ok();
             }
-            if y1 - y0 >= LABEL_TWO_LINES
+            if spot.y1 - spot.y0 >= LABEL_TWO_LINES
                 && let Some(line) = fit_line(window, &detail, &font, DETAIL_SIZE, text, width)
             {
                 line.paint(point(origin.x, origin.y + px(NAME_LINE)), px(DETAIL_LINE), TextAlign::Left, None, window, cx).ok();
@@ -537,30 +557,44 @@ pub fn paint_icicle_labels(
     }
 }
 
-/// The part of `painted[i]`'s bar that's showing, if there's enough of it for a label:
-/// inside its gap, right of the first column, and clear of bars painted after it that
-/// overlap it from the left or right.
-fn visible_bar(geometry: &Geometry, painted: &[Painted], i: usize) -> Option<(f32, f32, f32, f32)> {
-    let bar = &painted[i];
-    let (mut x0, y0, mut x1, y1) = geometry.icicle_bar(bar.r0.max(geometry.inner_radius), bar.r1, bar.start, bar.end)?;
-    let big_enough = |x0: f32, x1: f32| x1 - x0 >= LABEL_MIN_WIDTH && y1 - y0 >= LABEL_MIN_HEIGHT;
+/// Where a bar's label goes (see `label_spot`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Spot {
+    /// The whole bar, inside its gap and right of the first column: the label sits on it
+    /// and is fitted to it.
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    /// Left and right of the part that's showing, which the label is clipped to.
+    shown: (f32, f32),
+}
+
+/// Where `painted[i]`'s label goes, if its bar is big enough for one and some of it is
+/// showing: not past what the reveal has uncovered, nor under bars painted after it that
+/// overlap it from the left or right (a folder's contents sliding out from under it).
+fn label_spot(geometry: &Geometry, painted: &[Painted], i: usize) -> Option<Spot> {
+    let bar = &painted[i].band;
+    let (x0, y0, x1, y1) = geometry.icicle_bar(bar.r0.max(geometry.inner_radius), bar.r1, bar.start, bar.end)?;
     // Cheap test first: most bars are far too small to label, and need no more work.
-    if !big_enough(x0, x1) {
+    if x1 - x0 < LABEL_MIN_WIDTH || y1 - y0 < LABEL_MIN_HEIGHT {
         return None;
     }
+    let (mut left, mut right) = (x0, x1.min(bar.reach - GAP_PX / 2.0));
     // Neighbouring columns meet at an edge; only a real overlap counts.
     const SLACK: f32 = 0.5;
     for over in &painted[i + 1..] {
-        if over.end <= bar.start + 1e-5 || over.start >= bar.end - 1e-5 || over.r1 <= x0 + SLACK || over.r0 >= x1 - SLACK {
+        let over = &over.band;
+        if over.end <= bar.start + 1e-5 || over.start >= bar.end - 1e-5 || over.reach <= left + SLACK || over.r0 >= right - SLACK {
             continue;
         }
-        if over.r0 <= x0 {
-            x0 = over.r1 + GAP_PX / 2.0;
+        if over.r0 <= left {
+            left = over.reach + GAP_PX / 2.0;
         } else {
-            x1 = over.r0 - GAP_PX / 2.0;
+            right = over.r0 - GAP_PX / 2.0;
         }
     }
-    big_enough(x0, x1).then_some((x0, y0, x1, y1))
+    (right > left).then_some(Spot { x0, y0, x1, y1, shown: (left, right) })
 }
 
 #[cfg(test)]
@@ -678,25 +712,56 @@ mod tests {
         assert!(dark.lightness > 0.9 && (dark.alpha - 0.46).abs() < 1e-4, "faded with the bar");
     }
 
-    /// A folder's contents sliding out from under it only get labels where they show.
+    fn bar(index: usize, r0: f32, r1: f32, start: f32, end: f32) -> Painted {
+        Painted { index, band: Band { r0, r1, reach: r1, start, end, color: hsla(0.5, 0.5, 0.5, 1.0), alpha: 1.0 } }
+    }
+
+    /// A folder's contents sliding out from under it: the label sits on the whole bar, and
+    /// is only clipped to where it shows.
     #[test]
     fn labels_keep_to_the_part_of_a_bar_that_shows() {
         let g = Geometry::icicle(bounds());
         let (c1, c2) = (g.rings[0], g.rings[1]);
         let half = (c2.1 - c2.0) / 2.0;
         // The child is halfway out from under its parent, which is painted over it.
-        let child = Painted { index: 1, r0: c1.0 + half, r1: c1.1 + half, start: 0.0, end: 0.5, alpha: 1.0 };
-        let parent = Painted { index: 0, r0: c1.0, r1: c1.1, start: 0.0, end: 0.5, alpha: 1.0 };
-        let (x0, _, x1, _) = visible_bar(&g, &[child, parent], 0).unwrap();
-        assert!(x0 > c1.1 && (x1 - (c1.1 + half)).abs() < 1.0, "{x0} {x1}");
+        let child = bar(1, c1.0 + half, c1.1 + half, 0.0, 0.5);
+        let parent = bar(0, c1.0, c1.1, 0.0, 0.5);
+        let spot = label_spot(&g, &[child, parent], 0).unwrap();
+        assert!((spot.x0 - (c1.0 + half + GAP_PX / 2.0)).abs() < 1e-3 && (spot.x1 - (c1.1 + half - GAP_PX / 2.0)).abs() < 1e-3, "{spot:?}");
+        assert!(spot.shown.0 > c1.1 && (spot.shown.1 - spot.x1).abs() < 1e-3, "{spot:?}");
         // Neighbouring columns don't hide each other.
-        let next = Painted { index: 2, r0: c2.0, r1: c2.1, start: 0.0, end: 0.25, alpha: 1.0 };
-        assert!((visible_bar(&g, &[parent, next], 0).unwrap().2 - (c1.1 - GAP_PX / 2.0)).abs() < 1e-3);
+        let next = bar(2, c2.0, c2.1, 0.0, 0.25);
+        assert!((label_spot(&g, &[parent, next], 0).unwrap().shown.1 - (c1.1 - GAP_PX / 2.0)).abs() < 1e-3);
         // Nor does anything in the first column get a label.
-        let sunk = Painted { index: 3, r0: g.inner_radius - 30.0, r1: g.inner_radius, start: 0.0, end: 1.0, alpha: 1.0 };
-        assert_eq!(visible_bar(&g, &[sunk], 0), None);
-        // Too thin to read.
-        let thin = Painted { start: 0.0, end: 0.01, ..parent };
-        assert_eq!(visible_bar(&g, &[thin], 0), None);
+        let sunk = bar(3, g.inner_radius - 30.0, g.inner_radius, 0.0, 1.0);
+        assert_eq!(label_spot(&g, &[sunk], 0), None);
+        // Too thin to read, even though it's tall enough for the letters themselves.
+        let height = |turns: f32| turns * (634.0 - 102.0) - GAP_PX;
+        assert_eq!(label_spot(&g, &[bar(0, c1.0, c1.1, 0.0, 0.01)], 0), None);
+        let short = (LABEL_MIN_HEIGHT - 1.0 + GAP_PX) / (634.0 - 102.0);
+        assert!(height(short) > 15.0);
+        assert_eq!(label_spot(&g, &[bar(0, c1.0, c1.1, 0.0, short)], 0), None, "descenders would be cut off");
+    }
+
+    /// While the reveal uncovers a bar, its label is fitted to the whole bar (so the text
+    /// doesn't change as more of it shows) and clipped to what's uncovered.
+    #[test]
+    fn labels_are_uncovered_with_their_bars() {
+        let g = Geometry::icicle(bounds());
+        let (r0, r1) = g.rings[0];
+        let revealing = Painted { band: Band { reach: r0 + 10.0, ..bar(0, r0, r1, 0.0, 0.5).band }, ..bar(0, r0, r1, 0.0, 0.5) };
+        let spot = label_spot(&g, &[revealing], 0).expect("a label, partly uncovered");
+        assert!((spot.x1 - spot.x0 - (r1 - r0 - GAP_PX)).abs() < 1e-3, "fitted to the whole bar: {spot:?}");
+        assert!((spot.shown.1 - (r0 + 10.0 - GAP_PX / 2.0)).abs() < 1e-3, "clipped to what's uncovered: {spot:?}");
+        // Nothing uncovered yet: no label.
+        let hidden = Painted { band: Band { reach: r0, ..revealing.band }, ..revealing };
+        assert_eq!(label_spot(&g, &[hidden], 0), None);
+    }
+
+    #[test]
+    fn names_with_newlines_become_one_line() {
+        assert_eq!(single_line(&"Icon\r".into()).as_ref(), "Icon ");
+        assert_eq!(single_line(&"two\nlines\tand a tab".into()).as_ref(), "two lines and a tab");
+        assert_eq!(single_line(&"plain…".into()).as_ref(), "plain…");
     }
 }
