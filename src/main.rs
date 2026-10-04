@@ -1,3 +1,4 @@
+mod admin;
 mod app;
 mod classify;
 mod clock;
@@ -24,7 +25,7 @@ use gpui::{
     point, prelude::*, px, size,
 };
 
-use app::{ChartType, GoUp, OpenFolder, Petal, Rescan, ShowIcicle, ShowSunburst, ShowTreemap, StartOver};
+use app::{ChartType, GoUp, OpenFolder, Petal, ReadAsAdmin, Rescan, ShowIcicle, ShowSunburst, ShowTreemap, StartOver};
 
 actions!(petal, [Quit, Hide, HideOthers, ShowAll, Minimize, Zoom, CloseWindow]);
 
@@ -43,6 +44,11 @@ fn main() {
     if args.get(1).map(String::as_str) == Some("--check-access") {
         println!("full disk access: {}", if onboarding::has_full_disk_access() { "yes" } else { "no" });
         return;
+    }
+    // The administrator helper (see `admin`): `petal --admin <job file>`, started as root.
+    if args.get(1).map(String::as_str) == Some("--admin") {
+        let Some(job) = args.get(2) else { std::process::exit(2) };
+        std::process::exit(admin::helper_main(std::path::Path::new(job)));
     }
     // Headless live-chart benchmark: `petal --bench-live <path> [runs]`
     if args.get(1).map(String::as_str) == Some("--bench-live") {
@@ -130,6 +136,7 @@ pub fn menus(chart: ChartType) -> Vec<Menu> {
             items: vec![
                 MenuItem::action("Open Folder…", OpenFolder),
                 MenuItem::action("Rescan", Rescan),
+                MenuItem::action("Read Protected Folders as Administrator…", ReadAsAdmin),
                 MenuItem::separator(),
                 MenuItem::action("Show Disks", StartOver),
                 MenuItem::separator(),

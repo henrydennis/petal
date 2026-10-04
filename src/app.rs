@@ -16,6 +16,7 @@ use gpui::{
 
 use palette::IntoColor;
 
+use crate::admin;
 use crate::classify::{self, CATEGORIES, Category};
 use crate::clock;
 use crate::disk;
@@ -31,7 +32,7 @@ use crate::trashing;
 use crate::treemap::{self, TreemapMotion};
 use crate::watch;
 
-actions!(petal, [GoUp, OpenFolder, Rescan, StartOver, ShowSunburst, ShowIcicle, ShowTreemap]);
+actions!(petal, [GoUp, OpenFolder, Rescan, StartOver, ShowSunburst, ShowIcicle, ShowTreemap, ReadAsAdmin]);
 
 const BG: u32 = 0x1c1d21;
 const PANEL: u32 = 0x232529;
@@ -108,8 +109,9 @@ impl Render for Tooltip {
     }
 }
 
-fn tooltip(text: &'static str) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
-    move |_, cx| cx.new(|_| Tooltip(text.into())).into()
+fn tooltip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
+    let text = text.into();
+    move |_, cx| cx.new(|_| Tooltip(text.clone())).into()
 }
 
 #[derive(Clone)]
@@ -362,7 +364,27 @@ struct Results {
     trashing: bool,
     /// The last move to the Trash, confirmed in the Collector until it changes again.
     trashed: Option<Trashed>,
+    /// Reading the unreadable folders as an administrator.
+    admin: AdminRead,
+    /// Time Machine snapshots are being deleted.
+    deleting_snapshots: bool,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AdminRead {
+    /// Not yet: offer it while folders are unreadable.
+    Offered,
+    /// The password dialog is up, or the helper is reading.
+    Reading,
+    /// Done (whatever is still unreadable, macOS keeps even from administrators).
+    Done,
+    /// The user said "Not now".
+    Dismissed,
+}
+
+/// The password dialog's message when reading as an administrator.
+const ADMIN_READ_PROMPT: &str = "Petal wants to read the folders that belong to macOS and other users, to include their sizes. It only reads names and sizes; nothing is changed.";
+const DELETE_SNAPSHOTS_PROMPT: &str = "Petal wants to delete Time Machine’s local snapshots to free the space they hold.";
 
 struct Trashed {
     /// The item's name, or how many there were.
@@ -405,6 +427,8 @@ impl Results {
             surveying: Vec::new(),
             trashing: false,
             trashed: None,
+            admin: AdminRead::Offered,
+            deleting_snapshots: false,
         };
         results.homes = home_folders(&results.tree);
         results.relayout();
@@ -613,7 +637,7 @@ fn is_covered(tree: &Tree, set: &HashSet<usize>, mut ix: usize) -> bool {
 fn category_of(tree: &Tree, homes: &[usize], ix: usize) -> Category {
     let node = &tree.nodes[ix];
     let path = match node.kind {
-        Kind::Other if [disk::NOT_SCANNED, disk::NOT_READABLE].contains(&node.name.as_ref()) => return Category::Mixed,
+        Kind::Other if disk::is_remainder(&node.name) => return Category::Mixed,
         Kind::Other => return Category::System,
         _ => {
             // Inside a home folder, describe the path from it (`~/…`) wherever the home
@@ -1032,16 +1056,293 @@ impl Petal {
             return;
         }
         r.refreshing = false;
+        self.splice(fresh, errors, cx);
+    }
+
+    /// Read the folders the scan couldn't, as an administrator (macOS asks for a password),
+    /// and fold them into the results.
+    fn read_as_admin(&mut self, cx: &mut Context<Self>) {
+        let Some(r) = self.results() else { return };
+        if r.admin == AdminRead::Reading {
+            return;
+        }
+        let tree = &r.tree;
+        let mut sent = Vec::new();
+        let stale: Vec<scan::Stale> = tree
+            .unreadable
+            .iter()
+            .filter_map(|u| {
+                let ix = tree.find(&u.path).filter(|&ix| tree.nodes[ix].kind == Kind::Dir)?;
+                sent.push(u.clone());
+                Some(scan::Stale {
+                    ix,
+                    path: u.path.clone(),
+                    recursive: u.whole,
+                    known_dirs: tree.nodes[ix].children.iter().filter(|&&c| tree.nodes[c].kind == Kind::Dir).map(|&c| tree.nodes[c].name.to_string()).collect(),
+                })
+            })
+            .collect();
+        if stale.is_empty() {
+            self.show_notice("Petal could already read every folder here.".into(), cx);
+            return;
+        }
+        let job = admin::Job::Read { root: tree.root_path.clone(), stale, hardlinks: tree.hardlinks.clone() };
+        r.admin = AdminRead::Reading;
+        let id = r.id;
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(async move { admin::run(&job, ADMIN_READ_PROMPT) }).await;
+            this.update(cx, |this, cx| this.admin_read_done(id, sent, result, cx)).ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn admin_read_done(&mut self, id: u64, sent: Vec<scan::Unreadable>, result: Result<admin::Outcome, admin::Error>, cx: &mut Context<Self>) {
+        let Some(r) = self.results() else { return };
+        if r.id != id {
+            return;
+        }
+        let read = match result {
+            Ok(admin::Outcome::Read(read)) => read,
+            Ok(_) | Err(admin::Error::Cancelled) => {
+                r.admin = AdminRead::Offered;
+                cx.notify();
+                return;
+            }
+            Err(admin::Error::Failed(why)) => {
+                r.admin = AdminRead::Offered;
+                self.show_warning(format!("Couldn’t read as administrator: {why}"), cx);
+                return;
+            }
+        };
+        let read_before = scanned_size(&r.tree);
+        // The folders sent are accounted for again by what came back.
+        r.tree.errors = r.tree.errors.saturating_sub(sent.iter().map(|u| u.errors).sum());
+        r.tree.unreadable.retain(|u| !sent.contains(u));
+        r.tree.unreadable.extend(read.unreadable);
+        if r.tree.unreadable.is_empty() {
+            r.tree.hardlinks = HashSet::new();
+        }
+        r.admin = AdminRead::Done;
+        let still = r.tree.unreadable.len();
+        self.splice(read.fresh, read.errors, cx);
+        let Some(r) = self.results() else { return };
+        let found = scanned_size(&r.tree).saturating_sub(read_before);
+        let notice = match still {
+            0 => format!("Read every protected folder: {} more accounted for.", format_size(found)),
+            n => format!(
+                "Read the protected folders: {} more accounted for. macOS keeps {} even from administrators.",
+                format_size(found),
+                if n == 1 { "1 folder".to_string() } else { format!("{} folders", format_count(n as u64)) }
+            ),
+        };
+        self.show_notice(notice, cx);
+        cx.notify();
+    }
+
+    /// Delete the startup disk's Time Machine snapshots (macOS asks for a password), then
+    /// say what that freed.
+    fn delete_snapshots(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(r) = self.results() else { return };
+        if r.deleting_snapshots {
+            return;
+        }
+        let names: Vec<String> = r.tree.snapshots.iter().filter(|s| s.is_time_machine()).map(|s| s.name.clone()).collect();
+        if names.is_empty() {
+            return;
+        }
+        let message = match names.len() {
+            1 => "Delete the Time Machine snapshot?".to_string(),
+            n => format!("Delete {n} Time Machine snapshots?"),
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &message,
+            Some("Time Machine keeps local snapshots for a day so you can restore recent changes. Deleting them frees the space they hold; your Time Machine backups aren’t affected. macOS asks for an administrator’s password."),
+            &["Delete Snapshots", "Cancel"],
+            cx,
+        );
+        let id = r.id;
+        cx.spawn(async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let before = this
+                .update(cx, |this, cx| {
+                    let r = this.results()?;
+                    r.deleting_snapshots = true;
+                    cx.notify();
+                    Some(remainder_size(&r.tree))
+                })
+                .ok()
+                .flatten();
+            let Some(before) = before else { return };
+            let result = cx
+                .background_spawn(async move {
+                    let layout = disk::startup_layout(scan::startup_disk_name()).ok_or_else(|| admin::Error::Failed("the startup disk isn’t APFS".into()))?;
+                    let job = admin::Job::DeleteSnapshots { device: layout.data_device, names };
+                    let outcome = admin::run(&job, DELETE_SNAPSHOTS_PROMPT);
+                    // APFS frees a snapshot's blocks in the background; give it a moment.
+                    if outcome.is_ok() {
+                        std::thread::sleep(Duration::from_secs(2));
+                    }
+                    outcome
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                let Some(r) = this.results() else { return };
+                if r.id != id {
+                    return;
+                }
+                r.deleting_snapshots = false;
+                match result {
+                    Ok(admin::Outcome::Deleted { failed }) => {
+                        scan::refresh_volume_slices(&mut r.tree);
+                        r.relayout();
+                        let freed = before.saturating_sub(remainder_size(&r.tree));
+                        match failed.first() {
+                            None if freed > 0 => this.show_notice(format!("Deleted the snapshots, freeing {} so far.", format_size(freed)), cx),
+                            None => this.show_notice("Deleted the snapshots. APFS frees their space over the next minute or so.".into(), cx),
+                            Some((_, why)) => this.show_warning(format!("Couldn’t delete {} of the snapshots: {why}", failed.len()), cx),
+                        }
+                        this.refresh_slices_later(id, cx);
+                    }
+                    Ok(_) | Err(admin::Error::Cancelled) => {}
+                    Err(admin::Error::Failed(why)) => this.show_warning(format!("Couldn’t delete the snapshots: {why}"), cx),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// APFS frees a deleted snapshot's blocks in the background, so look at the volume's
+    /// usage again a little later (file changes would do it too, but there may be none).
+    fn refresh_slices_later(&mut self, id: u64, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            for wait in [10, 30] {
+                cx.background_executor().timer(Duration::from_secs(wait)).await;
+                let gone = this
+                    .update(cx, |this, cx| {
+                        let Some(r) = this.results().filter(|r| r.id == id) else { return true };
+                        scan::refresh_volume_slices(&mut r.tree);
+                        r.relayout();
+                        cx.notify();
+                        false
+                    })
+                    .unwrap_or(true);
+                if gone {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Offer to read the folders the scan couldn't, once Full Disk Access isn't the question.
+    fn render_admin_card(&self, r: &Results, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let access_card_shown = matches!(self.access, Access::Missing | Access::JustGranted);
+        if r.tree.unreadable.is_empty() || access_card_shown || matches!(r.admin, AdminRead::Done | AdminRead::Dismissed) {
+            return None;
+        }
+        let folders = match r.tree.unreadable.len() {
+            1 => "1 folder belongs".to_string(),
+            n => format!("{} folders belong", format_count(n as u64)),
+        };
+        let reading = r.admin == AdminRead::Reading;
+        let body = if reading {
+            "Reading as administrator…".to_string()
+        } else {
+            format!("{folders} to macOS or other users. An administrator can read them; Petal only reads names and sizes.")
+        };
+        Some(
+            card()
+                .child(div().font_weight(FontWeight::SEMIBOLD).child("Read protected folders"))
+                .child(div().text_xs().text_color(rgb(MUTED)).child(body))
+                .when(!reading, |d| {
+                    d.child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .justify_end()
+                            .mt_1()
+                            .child(button("admin-later", "Not now").on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(r) = this.results() {
+                                    r.admin = AdminRead::Dismissed;
+                                }
+                                cx.notify();
+                            })))
+                            .child(
+                                primary_button("admin-read", "Read as Administrator…", ACCENT)
+                                    .tooltip(tooltip("macOS asks for an administrator’s password"))
+                                    .on_click(cx.listener(|this, _, _, cx| this.read_as_admin(cx))),
+                            ),
+                    )
+                }),
+        )
+    }
+
+    /// The startup disk's APFS snapshots, and a way to delete Time Machine's.
+    fn render_snapshots_card(&self, r: &Results, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let snapshots = &r.tree.snapshots;
+        if snapshots.is_empty() {
+            return None;
+        }
+        let title = match snapshots.len() {
+            1 => "1 APFS snapshot".to_string(),
+            n => format!("{n} APFS snapshots"),
+        };
+        let mut kinds: Vec<(&str, usize)> = Vec::new();
+        for snapshot in snapshots {
+            match kinds.iter_mut().find(|(kind, _)| *kind == snapshot.kind()) {
+                Some((_, count)) => *count += 1,
+                None => kinds.push((snapshot.kind(), 1)),
+            }
+        }
+        let mut summary = kinds.iter().map(|(kind, count)| format!("{count} {kind}")).collect::<Vec<_>>().join(", ");
+        if let Some(oldest) = snapshots.first() {
+            summary.push_str(&format!(" · oldest {}", format_date(oldest.created)));
+        }
+        let time_machine = snapshots.iter().filter(|s| s.is_time_machine()).count();
+        let explanation = if time_machine > 0 {
+            "Snapshots keep earlier copies of your files, so deleting a file frees nothing while a snapshot still holds it. APFS doesn’t say how much each one holds: it’s part of “Snapshots and unreadable”. Time Machine’s are a day’s quick undo, safe to delete; the rest belong to macOS or other apps, which remove them when they’re done."
+        } else {
+            "Snapshots keep earlier copies of your files, so deleting a file frees nothing while a snapshot still holds it. APFS doesn’t say how much each one holds: it’s part of “Snapshots and unreadable”. These belong to macOS or other apps, which remove them when they’re done."
+        };
+        let deleting = r.deleting_snapshots;
+        Some(
+            card()
+                .id("snapshots")
+                .tooltip(tooltip(explanation))
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+                .child(div().text_xs().text_color(rgb(MUTED)).child(summary))
+                .when(time_machine > 0, |d| {
+                    let label = if deleting { "Deleting…" } else { "Delete Time Machine Snapshots…" };
+                    d.child(
+                        div().flex().justify_end().mt_1().child(
+                            button("snapshots-delete", label)
+                                .when(!deleting, |b| b.on_click(cx.listener(|this, _, window, cx| this.delete_snapshots(window, cx)))),
+                        ),
+                    )
+                }),
+        )
+    }
+
+    /// Bring folders that were read again into the results: sizes, the volume slices,
+    /// findings and the Collector.
+    fn splice(&mut self, fresh: Vec<(usize, scan::Fresh)>, errors: u64, cx: &mut Context<Self>) {
+        let Some(r) = self.results() else { return };
         let touched: Vec<usize> = fresh.iter().map(|(ix, _)| *ix).collect();
         let focus_path = path_to(&r.tree, r.focus);
         let hovered = match r.chart_hover {
             Some(Hit::Segment(i)) => r.segments.get(i).map(|s| s.target),
             _ => None,
         };
+        r.tree.errors += errors;
         if scan::apply_changes(&mut r.tree, fresh) == 0 {
             return;
         }
-        r.tree.errors += errors;
         if r.requested_root == std::path::Path::new("/") {
             scan::refresh_volume_slices(&mut r.tree);
         }
@@ -1379,6 +1680,7 @@ impl Render for Petal {
             .on_action(cx.listener(Self::rescan))
             .on_action(cx.listener(Self::start_over))
             .on_action(cx.listener(Self::go_up))
+            .on_action(cx.listener(|this, _: &ReadAsAdmin, _, cx| this.read_as_admin(cx)))
             .on_action(cx.listener(|this, _: &ShowSunburst, _, cx| this.set_chart(ChartType::Sunburst, cx)))
             .on_action(cx.listener(|this, _: &ShowIcicle, _, cx| this.set_chart(ChartType::Icicle, cx)))
             .on_action(cx.listener(|this, _: &ShowTreemap, _, cx| this.set_chart(ChartType::Treemap, cx)))
@@ -1435,6 +1737,61 @@ impl Render for Petal {
                 )
             })
     }
+}
+
+/// The card the sidebar's notes sit on (Full Disk Access, protected folders, snapshots).
+fn card() -> gpui::Div {
+    div().mx_3().mb_2().p_3().rounded_lg().bg(rgb(CARD)).border_1().border_color(rgb(BORDER)).flex().flex_col().gap_1()
+}
+
+/// Purgeable space below this isn't worth a mention.
+const MIN_PURGEABLE: u64 = 1_000_000;
+
+const PURGEABLE_TOOLTIP: &str = "Space macOS frees by itself when it needs room: Time Machine snapshots, iCloud files it can download again, caches. It’s already counted in the sizes here.";
+
+fn shows_purgeable(tree: &Tree) -> bool {
+    tree.purgeable.is_some_and(|p| p >= MIN_PURGEABLE)
+}
+
+/// Bytes read from disk: everything but the volume slices.
+fn scanned_size(tree: &Tree) -> u64 {
+    let root = &tree.nodes[Tree::ROOT];
+    let slices: u64 = root.children.iter().filter(|&&c| tree.nodes[c].kind == Kind::Other).map(|&c| tree.nodes[c].size).sum();
+    root.size.saturating_sub(slices)
+}
+
+/// The startup disk's "Not readable" (or "Snapshots and unreadable") slice.
+fn remainder_size(tree: &Tree) -> u64 {
+    tree.nodes[Tree::ROOT]
+        .children
+        .iter()
+        .filter(|&&c| tree.nodes[c].kind == Kind::Other && disk::is_remainder(&tree.nodes[c].name))
+        .map(|&c| tree.nodes[c].size)
+        .sum()
+}
+
+/// "4 Oct" this year, "4 Oct 2025" otherwise (UTC is near enough for a date).
+fn format_date(seconds: i64) -> String {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let (year, month, day) = civil_from_days(seconds.div_euclid(86_400));
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let (this_year, _, _) = civil_from_days(now.div_euclid(86_400));
+    let month = MONTHS[(month - 1) as usize];
+    if year == this_year { format!("{day} {month}") } else { format!("{day} {month} {year}") }
+}
+
+/// Days since 1970-01-01 to (year, month, day), after Howard Hinnant's algorithm.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+    (year, month, day)
 }
 
 fn button_base(id: impl Into<gpui::ElementId>, label: impl Into<SharedString>) -> Stateful<gpui::Div> {
@@ -1606,12 +1963,21 @@ impl Petal {
                             .flex_col()
                             .gap_1()
                             .child(div().text_base().font_weight(FontWeight::SEMIBOLD).truncate().child(volume.name.clone()))
-                            .child(div().text_color(rgb(MUTED)).child(format!(
-                                "{} used · {} free of {}",
-                                format_size(used),
-                                format_size(volume.free),
-                                format_size(volume.total)
-                            )))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_1()
+                                    .text_color(rgb(MUTED))
+                                    .child(format!("{} used · {} free of {}", format_size(used), format_size(volume.free), format_size(volume.total)))
+                                    .when(volume.purgeable.is_some_and(|p| p >= MIN_PURGEABLE), |d| {
+                                        d.child("·").child(
+                                            div()
+                                                .id(("purgeable", i))
+                                                .tooltip(tooltip(PURGEABLE_TOOLTIP))
+                                                .child(format!("{} purgeable", format_size(volume.purgeable.unwrap_or(0)))),
+                                        )
+                                    }),
+                            )
                             .child(meter(fraction)),
                     )
                     .child(
@@ -1927,11 +2293,13 @@ impl Petal {
                     )))
                     // Counts for the whole scan, so only at its top, in one line; the
                     // tooltips explain them.
-                    .when(r.focus == Tree::ROOT && (r.tree.cloud_only > 0 || r.tree.errors > 0), |d| {
+                    .when(r.focus == Tree::ROOT && (r.tree.cloud_only > 0 || r.tree.errors > 0 || shows_purgeable(&r.tree)), |d| {
                         let unreadable_reason = if self.access == Access::Missing {
                             "Private to macOS until Petal has Full Disk Access"
+                        } else if r.admin == AdminRead::Done {
+                            "Protected by macOS; not even an administrator can read them"
                         } else {
-                            "Protected by macOS or owned by another user; not even Full Disk Access opens them"
+                            "Owned by macOS or another user: File › Read Protected Folders as Administrator reads them"
                         };
                         d.child(
                             div()
@@ -1955,6 +2323,14 @@ impl Petal {
                                             .tooltip(tooltip(unreadable_reason))
                                             .child(format!("{} unreadable", format_count(r.tree.errors))),
                                     )
+                                })
+                                .when(shows_purgeable(&r.tree), |d| {
+                                    d.when(r.tree.cloud_only > 0 || r.tree.errors > 0, |d| d.child("·")).child(
+                                        div()
+                                            .id("purgeable")
+                                            .tooltip(tooltip(PURGEABLE_TOOLTIP))
+                                            .child(format!("{} purgeable", format_size(r.tree.purgeable.unwrap_or(0)))),
+                                    )
                                 }),
                         )
                     }),
@@ -1967,6 +2343,8 @@ impl Petal {
                     .map(|&c| r.tree.nodes[c].size);
                 self.render_access_card(not_readable, cx)
             }).flatten())
+            .children((r.focus == Tree::ROOT).then(|| self.render_admin_card(r, cx)).flatten())
+            .children((r.focus == Tree::ROOT).then(|| self.render_snapshots_card(r, cx)).flatten())
             .when(r.focus == Tree::ROOT && !r.findings.is_empty(), |d| {
                 d.child(self.render_findings(&r.findings, true, &r.findings_collected(), cx))
             })
@@ -2444,7 +2822,8 @@ impl Petal {
                 let detail = match node.kind {
                     Kind::Dir => format!("{} files", format_count(node.items)),
                     Kind::File => "file".into(),
-                    Kind::Other if node.name.as_ref() == disk::NOT_READABLE => "needs Full Disk Access".into(),
+                    Kind::Other if node.name.as_ref() == disk::NOT_READABLE => "not readable without more access".into(),
+                    Kind::Other if node.name.as_ref() == disk::SNAPSHOTS_AND_UNREADABLE => "held by APFS snapshots, or not readable".into(),
                     Kind::Other => "exact, from APFS".into(),
                 };
                 let kind = match r.category(Target::Node(ix)) {
@@ -2893,4 +3272,17 @@ fn disk_gauge(fraction: f32) -> impl IntoElement {
     )
     .size(px(48.))
     .flex_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(20_730), (2026, 10, 4));
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29));
+        assert_eq!(format_date(946_684_800), "1 Jan 2000");
+    }
 }

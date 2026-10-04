@@ -955,6 +955,7 @@ mod tests {
             ],
             errors: 0,
             cloud_only: 0,
+            ..Default::default()
         }
     }
 

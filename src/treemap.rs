@@ -881,7 +881,7 @@ mod tests {
         add("release", 799, Kind::Dir, Some(build));
         add("stray", 1, Kind::Dir, Some(build));
         add("empty", 10, Kind::Dir, Some(root));
-        Tree { root_path: PathBuf::from("/"), nodes, errors: 0, cloud_only: 0 }
+        Tree { root_path: PathBuf::from("/"), nodes, errors: 0, cloud_only: 0, ..Default::default() }
     }
 
     /// Opening a folder one folder fills goes on into it, as far as the chain goes. A folder

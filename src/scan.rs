@@ -36,12 +36,33 @@ pub struct Node {
     pub items: u64,
 }
 
+#[derive(Default)]
 pub struct Tree {
     pub root_path: PathBuf,
     pub nodes: Vec<Node>,
     pub errors: u64,
     /// Cloud-only folders that were skipped rather than downloaded.
     pub cloud_only: u64,
+    /// Folders that couldn't be read (wholly or in part), for reading as administrator.
+    pub unreadable: Vec<Unreadable>,
+    /// Hard-linked files already counted, kept only while some folders are unreadable, so
+    /// reading those later counts each file once across both reads.
+    pub hardlinks: HashSet<(u64, u64)>,
+    /// On the startup disk, the Data volume's APFS snapshots.
+    pub snapshots: Vec<disk::Snapshot>,
+    /// Space on the scanned volume that macOS can free by itself (see `disk::purgeable`);
+    /// `None` when the scan isn't of a whole volume.
+    pub purgeable: Option<u64>,
+}
+
+/// A folder the walk couldn't read, or read only in part.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unreadable {
+    pub path: PathBuf,
+    /// Its listing failed outright; otherwise only some entries' metadata did.
+    pub whole: bool,
+    /// What it added to the error count.
+    pub errors: u64,
 }
 
 impl Tree {
@@ -164,15 +185,17 @@ pub struct Progress {
     /// Hotspot folders as they finish, with exact sizes.
     pub early_findings: Mutex<Vec<findings::Early>>,
     pub started: std::sync::OnceLock<std::time::Instant>,
+    /// Folders that couldn't be read, as they're met.
+    pub unreadable: Mutex<Vec<Unreadable>>,
 }
 
 /// A walked folder (or file), before it becomes tree nodes.
 pub struct Raw {
-    name: String,
-    size: u64,
-    kind: Kind,
-    items: u64,
-    children: Vec<Raw>,
+    pub(crate) name: String,
+    pub(crate) size: u64,
+    pub(crate) kind: Kind,
+    pub(crate) items: u64,
+    pub(crate) children: Vec<Raw>,
 }
 
 struct Walker<'a> {
@@ -194,6 +217,9 @@ fn disk_size(meta: &fs::Metadata) -> u64 {
 }
 
 impl Walker<'_> {
+    fn unreadable(&self, path: &Path, whole: bool, errors: u64) {
+        self.progress.unreadable.lock().unwrap().push(Unreadable { path: path.to_path_buf(), whole, errors });
+    }
 
     fn admissible_dir(&self, path: &Path, entry: &dirlist::Entry) -> bool {
         entry.is_dir && !entry.dataless && !self.skip.contains(path) && self.allowed_devices.contains(&entry.dev)
@@ -283,11 +309,13 @@ impl Walker<'_> {
             Ok((dir, listing)) => {
                 if listing.errors > 0 {
                     self.progress.errors.fetch_add(listing.errors, Ordering::Relaxed);
+                    self.unreadable(path, false, listing.errors);
                 }
                 (Some(dir), listing.entries)
             }
             Err(_) => {
                 self.progress.errors.fetch_add(1, Ordering::Relaxed);
+                self.unreadable(path, true, 1);
                 (None, Vec::new())
             }
         };
@@ -380,15 +408,22 @@ pub fn scan(root: &Path, progress: &Progress) -> Tree {
             let bases = findings::Bases::for_root(&layout.data_root);
             let mut tree = scan_with_bases(&layout.data_root, progress, &bases);
             add_volume_slices(&mut tree, &layout);
+            tree.snapshots = layout.snapshots.clone();
+            tree.purgeable = disk::purgeable(root);
             return tree;
         }
     }
-    if volume_used(root).is_some() {
+    let whole_volume = volume_used(root).is_some();
+    if whole_volume {
         if let Some(items) = volume_items(root) {
             let _ = progress.expected_items.set(items);
         }
     }
-    scan_with_bases(root, progress, &findings::Bases::for_root(root))
+    let mut tree = scan_with_bases(root, progress, &findings::Bases::for_root(root));
+    if whole_volume {
+        tree.purgeable = disk::purgeable(root);
+    }
+    tree
 }
 
 /// Files and folders in use on the volume mounted at `mount` (exact, from APFS).
@@ -413,7 +448,7 @@ fn add_volume_slices(tree: &mut Tree, layout: &DiskLayout) {
         .extras
         .iter()
         .cloned()
-        .chain((unreadable > 0).then(|| (disk::NOT_READABLE.to_string(), unreadable)));
+        .chain((unreadable > 0).then(|| (disk::remainder_label(&layout.snapshots).to_string(), unreadable)));
     let mut added = 0;
     for (name, size) in slices {
         let ix = tree.nodes.len();
@@ -433,7 +468,7 @@ pub fn sort_children(nodes: &mut [Node], ix: usize) {
     let mut children = std::mem::take(&mut nodes[ix].children);
     children.sort_by_key(|&c| {
         let node = &nodes[c];
-        let remainder = node.kind == Kind::Other && (node.name.as_ref() == disk::NOT_SCANNED || node.name.as_ref() == disk::NOT_READABLE);
+        let remainder = node.kind == Kind::Other && disk::is_remainder(&node.name);
         (remainder, std::cmp::Reverse(node.size))
     });
     nodes[ix].children = children;
@@ -501,11 +536,17 @@ fn scan_with_bases(root: &Path, progress: &Progress, bases: &findings::Bases) ->
     if std::env::var_os("PETAL_PHASES").is_some() {
         eprintln!("  walk {:.3}s  flatten {:.3}s", (flatten_start - walk_start).as_secs_f64(), flatten_start.elapsed().as_secs_f64());
     }
+    let unreadable = std::mem::take(&mut *progress.unreadable.lock().unwrap());
+    // Only an administrator's read of the unreadable folders needs these.
+    let hardlinks = if unreadable.is_empty() { HashSet::new() } else { walker.hardlinks.into_inner().unwrap() };
     Tree {
         root_path: root.to_path_buf(),
         nodes,
         errors: progress.errors.load(Ordering::Relaxed),
         cloud_only: progress.cloud_only.load(Ordering::Relaxed),
+        unreadable,
+        hardlinks,
+        ..Default::default()
     }
 }
 
@@ -712,8 +753,26 @@ pub enum Fresh {
 /// Read changed folders again, off the UI thread, by the same rules as the scan that built
 /// the tree rooted at `root`. Errors met while walking new folders are added to `errors`.
 pub fn read_changes(root: &Path, stale: Vec<Stale>, errors: &AtomicU64) -> Vec<(usize, Fresh)> {
+    let read = read_folders(root, stale, HashSet::new());
+    errors.fetch_add(read.errors, Ordering::Relaxed);
+    read.fresh
+}
+
+/// Folders read again by `read_folders`.
+pub struct FoldersRead {
+    pub fresh: Vec<(usize, Fresh)>,
+    /// Errors met while reading them.
+    pub errors: u64,
+    /// Those of them (or their contents) that still couldn't be read.
+    pub unreadable: Vec<Unreadable>,
+}
+
+/// Read folders of the tree rooted at `root` again (see `read_changes`). `hardlinks` are the
+/// hard-linked files the tree already counts, so none is counted twice.
+pub fn read_folders(root: &Path, stale: Vec<Stale>, hardlinks: HashSet<(u64, u64)>) -> FoldersRead {
     let progress = Progress::default();
-    let walker = walker(root, &progress);
+    let mut walker = walker(root, &progress);
+    walker.hardlinks = Mutex::new(hardlinks);
     dirlist::disable_cloud_downloads();
     let below_live = LIVE_DEPTH + 1;
     let fresh = stale
@@ -728,8 +787,8 @@ pub fn read_changes(root: &Path, stale: Vec<Stale>, errors: &AtomicU64) -> Vec<(
             result
         })
         .collect();
-    errors.fetch_add(progress.errors.load(Ordering::Relaxed), Ordering::Relaxed);
-    fresh
+    let unreadable = std::mem::take(&mut *progress.unreadable.lock().unwrap());
+    FoldersRead { fresh, errors: progress.errors.load(Ordering::Relaxed), unreadable }
 }
 
 /// One changed folder: listed (new subfolders walked in full), or rescanned whole.
@@ -746,7 +805,10 @@ fn read_one(walker: &Walker, progress: &Progress, stale: Stale, below_live: usiz
     for entry in listing.entries {
         let path = stale.path.join(&entry.name);
         if !entry.is_dir {
-            files.push((entry.name, entry.size, entry.nlink));
+            // Count a hard-linked file once, as the scan does. (Files the tree already has
+            // keep the scan's decision; see `apply_changes`.)
+            let counted = entry.nlink > 1 && !walker.hardlinks.lock().unwrap().insert((entry.dev, entry.ino));
+            files.push((entry.name, if counted { 0 } else { entry.size }, entry.nlink));
         } else if walker.skip.contains(&path) || !walker.allowed_devices.contains(&entry.dev) {
             // Not part of the tree (another volume, a mount point): as in the scan.
         } else if stale.known_dirs.contains(&entry.name) {
@@ -867,10 +929,19 @@ pub fn refresh_volume_slices(tree: &mut Tree) {
     let slices: Vec<usize> = root.children.iter().copied().filter(|&c| tree.nodes[c].kind == Kind::Other).collect();
     let scanned = root.size - slices.iter().map(|&c| tree.nodes[c].size).sum::<u64>();
     let unreadable = layout.data_used.saturating_sub(scanned);
+    let remainder = disk::remainder_label(&layout.snapshots).to_string();
     let mut total = scanned;
-    for (name, size) in layout.extras.iter().cloned().chain(std::iter::once((disk::NOT_READABLE.to_string(), unreadable))) {
-        match slices.iter().find(|&&c| tree.nodes[c].name.as_ref() == name) {
-            Some(&c) => tree.nodes[c].size = size,
+    for (name, size) in layout.extras.iter().cloned().chain(std::iter::once((remainder, unreadable))) {
+        // The remainder changes its name as snapshots come and go.
+        let same = |c: usize| {
+            let existing = tree.nodes[c].name.as_ref();
+            existing == name || (disk::is_remainder(existing) && disk::is_remainder(&name))
+        };
+        match slices.iter().copied().find(|&c| same(c)) {
+            Some(c) => {
+                tree.nodes[c].size = size;
+                tree.nodes[c].name = name.into();
+            }
             None if size > 0 => {
                 let ix = tree.nodes.len();
                 tree.nodes.push(Node { name: name.into(), size, kind: Kind::Other, parent: Some(Tree::ROOT), children: Vec::new(), items: 0 });
@@ -882,6 +953,8 @@ pub fn refresh_volume_slices(tree: &mut Tree) {
     }
     tree.nodes[Tree::ROOT].size = total;
     sort_children(&mut tree.nodes, Tree::ROOT);
+    tree.snapshots = layout.snapshots;
+    tree.purgeable = disk::purgeable(Path::new("/"));
 }
 
 fn flatten(raw: Raw, parent: Option<usize>, nodes: &mut Vec<Node>) -> usize {
@@ -939,6 +1012,8 @@ pub struct Volume {
     pub path: PathBuf,
     pub total: u64,
     pub free: u64,
+    /// What macOS can free by itself (see `disk::purgeable`).
+    pub purgeable: Option<u64>,
 }
 
 fn statvfs(path: &Path) -> Option<(u64, u64)> {
@@ -980,14 +1055,15 @@ pub fn volumes() -> Vec<Volume> {
             }
             if let Some((total, free)) = statvfs(&path) {
                 if total > 0 {
-                    others.push(Volume { name, path, total, free });
+                    let purgeable = disk::purgeable(&path);
+                    others.push(Volume { name, path, total, free, purgeable });
                 }
             }
         }
     }
     let mut volumes = Vec::new();
     if let Some((total, free)) = statvfs(Path::new("/")) {
-        volumes.push(Volume { name: root_name, path: PathBuf::from("/"), total, free });
+        volumes.push(Volume { name: root_name, path: PathBuf::from("/"), total, free, purgeable: disk::purgeable(Path::new("/")) });
     }
     others.sort_by(|a, b| a.name.cmp(&b.name));
     volumes.extend(others);
@@ -1094,7 +1170,7 @@ mod tests {
         let users = push("Users", Kind::Dir, Some(root));
         let sam = push("sam", Kind::Dir, Some(users));
         push("notes.txt", Kind::File, Some(sam));
-        let tree = Tree { root_path: PathBuf::from("/System/Volumes/Data"), nodes, errors: 0, cloud_only: 0 };
+        let tree = Tree { root_path: PathBuf::from("/System/Volumes/Data"), nodes, errors: 0, cloud_only: 0, ..Default::default() };
         assert_eq!(tree.changed_folder(Path::new("/Users/sam")), Some(sam));
         assert_eq!(tree.changed_folder(Path::new("/System/Volumes/Data/Users/sam")), Some(sam));
         // A new folder: its parent is read again and picks it up.
