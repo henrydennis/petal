@@ -66,14 +66,14 @@ const FOLD_STAGGER: f32 = 0.65;
 /// A critically damped spring: no overshoot, and a change of target mid-flight carries
 /// on smoothly from the current speed.
 #[derive(Clone, Copy, Debug)]
-struct Spring {
-    x: f32,
-    v: f32,
-    target: f32,
+pub(crate) struct Spring {
+    pub(crate) x: f32,
+    pub(crate) v: f32,
+    pub(crate) target: f32,
 }
 
 impl Spring {
-    fn still(x: f32, target: f32) -> Self {
+    pub(crate) fn still(x: f32, target: f32) -> Self {
         Self { x, v: 0.0, target }
     }
 
@@ -84,7 +84,7 @@ impl Spring {
 
     /// Exact solution over `dt`, so it's stable for any frame time. It's linear in the
     /// state, so edges that start together and share a target stay together.
-    fn step(&mut self, dt: f32) {
+    pub(crate) fn step(&mut self, dt: f32) {
         let offset = self.x - self.target;
         let c = self.v + OMEGA * offset;
         let decay = (-OMEGA * dt).exp();
@@ -92,7 +92,7 @@ impl Spring {
         self.v = (self.v - OMEGA * c * dt) * decay;
     }
 
-    fn settled(&self) -> bool {
+    pub(crate) fn settled(&self) -> bool {
         (self.x - self.target).abs() + self.v.abs() / OMEGA < SETTLED
     }
 }
@@ -706,7 +706,7 @@ fn opened(opening: &Opening, key: &Key, start: f32, end: f32) -> (f32, f32) {
 }
 
 /// Eases in and out with no jolt at either end (zero speed and acceleration).
-fn smootherstep(t: f32) -> f32 {
+pub(crate) fn smootherstep(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 }
