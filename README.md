@@ -25,15 +25,18 @@
 ---
 
 Petal shows your disk as a sunburst: the centre is the folder you're looking at, each ring is one
-level deeper, and the size of a slice is how much space it takes. It draws the picture *while* it
-reads, tells you which big folders are safe to clear, and tells you exactly how much deleting them
-will free.
+level deeper, and the size of a slice is how much space it takes. Prefer bars or boxes? The same
+picture also comes as an icicle or a treemap. It draws the picture *while* it reads, tells you which
+big folders are safe to clear, and tells you exactly how much deleting them will free.
 
 ## Highlights
 
 - **Live from the first second.** The chart appears straight away and fills in as Petal reads. Folders
   turn from muted to full colour the moment their total is final. The chart grows in place as one
   piece, folds over into size order when the scan finishes, and zooms like a camera.
+- **Three ways to see it.** A sunburst; an icicle, the sunburst unrolled into rows that fall from the
+  folder you're in, one per level, with room for names; or a treemap, the folder's contents as boxes
+  sized by the space they take. Switch with the **Chart** toggle in the toolbar or ⌘1, ⌘2, ⌘3.
 - **Fast.** A whole Mac (about 6 million files) in roughly 25 seconds; a typical home folder in a few
   seconds; a 90,000-item folder in under a second. Directory listings use `getattrlistbulk` and
   `openat` across all cores. The [performance notes](docs/PERFORMANCE.md) have the measurements.
@@ -61,6 +64,8 @@ will free.
 | **Results.** Findings, folder list and the full chart. | **Scanning.** Final folders in colour, the rest still counting. |
 | ![Zoomed into Library, hovering Caches](docs/zoom.png) | ![Collector with two items](docs/collector.png) |
 | **Explore.** Click a slice to zoom in; hover for sizes. | **Collector.** What deleting your selection frees, exactly. |
+| ![The same folder as an icicle](docs/icicle.png) | ![The same folder as a treemap, hovering Library](docs/treemap.png) |
+| **Icicle.** One row per level, falling from the folder, with names on the bars. | **Treemap.** The folder's contents as boxes sized by space; click one to go inside. |
 
 <p align="center"><img src="docs/live-scan.gif" width="720" alt="A live scan, slowed down 8×"><br><sub>A real scan of a sample home folder, slowed down 8×.</sub></p>
 
@@ -132,8 +137,11 @@ The first time you open Petal it starts scanning your startup disk straight away
 on the **Disks** screen, with your volumes, **Scan Home Folder** and **Choose Folder…**.
 
 - **Hover** a slice or a row to see its size; the two stay in sync.
-- **Click** a folder (in the chart or the list) to zoom in. Click the centre, or use the breadcrumbs,
-  to go back up.
+- **Click** a folder (in the chart or the list) to zoom in. Click the centre (the bar along the top of
+  the icicle or treemap), or use the breadcrumbs, to go back up. In the treemap, a folder that holds
+  little but one other folder (an app's `Contents`, say) opens straight through to what's inside.
+- **Chart** in the toolbar draws the same folders as a sunburst, icicle or treemap; **Colour** colours
+  them by folder or by kind.
 - **Click a finding** to open its folder in the chart; press **+** on it to collect it.
 - In the list, **⌕** reveals an item in Finder and **+** adds it to the Collector.
 - **Move to Trash…** asks for confirmation, moves the collected items to the Trash, and updates every
@@ -145,6 +153,7 @@ on the **Disks** screen, with your volumes, **Scan Home Folder** and **Choose Fo
 | ⌘R | Rescan |
 | ⌫, Esc or ⌘↑ | Go to the enclosing folder |
 | ⇧⌘D | Back to the Disks screen |
+| ⌘1, ⌘2, ⌘3 | Show the chart as a sunburst, icicle or treemap |
 | ⌘Q | Quit |
 
 You can also pass a folder on the command line: `petal ~/Library`.
@@ -160,7 +169,8 @@ src/
 ├── live.rs        live per-folder totals during a scan, snapshots, and the live-chart benchmark
 ├── disk.rs        the startup disk's APFS container: exact slices for the other volumes
 ├── findings.rs    the catalog of known space hogs and how to recognise them
-├── sunburst.rs    layout in angle space, painting with PathBuilder, polar hit-testing, colours
+├── sunburst.rs    layout in angle space; sunburst and icicle painting, hit-testing and labels; colours
+├── treemap.rs     a folder's contents as squarified boxes, with their own motion and labels
 ├── motion.rs      easing segments between live snapshots
 ├── eta.rs         progress (items vs. the volume's object count) and "about N s left"
 ├── onboarding.rs  first run and Full Disk Access detection

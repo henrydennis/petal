@@ -19,6 +19,11 @@
 //!   almost everything. Rather than shuffle, the scan's chart folds away clockwise, smallest
 //!   first, while the results open clockwise behind it at their true sizes, largest first
 //!   (`fold`).
+//!
+//! This drives the sunburst and the icicle alike, through `Geometry`, in the rings and turns
+//! `sunburst` describes: on the icicle, "outward" is top to bottom (down from the focus
+//! folder's bar) and "clockwise" is left to right. The treemap has its own motion,
+//! `treemap::TreemapMotion`, on the same principles.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -26,7 +31,7 @@ use std::time::Instant;
 use gpui::{Hsla, SharedString, Window, hsla};
 
 use crate::scan::Tree;
-use crate::sunburst::{self, Geometry, Segment};
+use crate::sunburst::{self, Band, Geometry, Painted, Segment};
 
 /// A segment's identity across layouts.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -66,14 +71,14 @@ const FOLD_STAGGER: f32 = 0.65;
 /// A critically damped spring: no overshoot, and a change of target mid-flight carries
 /// on smoothly from the current speed.
 #[derive(Clone, Copy, Debug)]
-struct Spring {
-    x: f32,
-    v: f32,
-    target: f32,
+pub(crate) struct Spring {
+    pub(crate) x: f32,
+    pub(crate) v: f32,
+    pub(crate) target: f32,
 }
 
 impl Spring {
-    fn still(x: f32, target: f32) -> Self {
+    pub(crate) fn still(x: f32, target: f32) -> Self {
         Self { x, v: 0.0, target }
     }
 
@@ -84,7 +89,7 @@ impl Spring {
 
     /// Exact solution over `dt`, so it's stable for any frame time. It's linear in the
     /// state, so edges that start together and share a target stay together.
-    fn step(&mut self, dt: f32) {
+    pub(crate) fn step(&mut self, dt: f32) {
         let offset = self.x - self.target;
         let c = self.v + OMEGA * offset;
         let decay = (-OMEGA * dt).exp();
@@ -92,7 +97,7 @@ impl Spring {
         self.v = (self.v - OMEGA * c * dt) * decay;
     }
 
-    fn settled(&self) -> bool {
+    pub(crate) fn settled(&self) -> bool {
         (self.x - self.target).abs() + self.v.abs() / OMEGA < SETTLED
     }
 }
@@ -255,7 +260,7 @@ pub struct ChartMotion {
     last_frame: Option<Instant>,
     /// Which layout the targets come from, to retarget only on change.
     layout_id: usize,
-    /// Share of the circle the chart covers (volume scans fill it as they go).
+    /// Share of the chart it covers, in turns (volume scans fill it as they go).
     fraction: Spring,
     /// Applied to the next layout: the focus changed.
     camera: Option<Camera>,
@@ -596,9 +601,24 @@ impl ChartMotion {
         moving
     }
 
-    /// Paint every segment where it is right now. `color` gets the segment's index in the
-    /// latest layout and its current angles (so hues can follow the motion).
-    pub fn paint(&mut self, window: &mut Window, geometry: &Geometry, mut color: impl FnMut(usize, f32, f32) -> Hsla) {
+    /// Paint every segment where it is right now, and say where the segments of the latest
+    /// layout went (for labels). `color` gets the segment's index in the latest layout and
+    /// its current angles (so hues can follow the motion).
+    pub fn paint(&mut self, window: &mut Window, geometry: &Geometry, color: impl FnMut(usize, f32, f32) -> Hsla) -> Vec<Painted> {
+        let mut painted = Vec::new();
+        for (index, band) in self.bands(geometry, color) {
+            geometry.paint_band(window, band.r0, band.reach, band.start, band.end, band.drawn_color());
+            if let Some(index) = index {
+                painted.push(Painted { index, band });
+            }
+        }
+        painted
+    }
+
+    /// Everything to draw this frame, bottom first, each with its index in the latest
+    /// layout if it's part of it: the scan's chart folding away, then the segments, outer
+    /// rings first.
+    fn bands(&mut self, geometry: &Geometry, mut color: impl FnMut(usize, f32, f32) -> Hsla) -> Vec<(Option<usize>, Band)> {
         let fraction = self.fraction.x;
         // The first chart is uncovered from the centre outward.
         let reach = match self.reveal {
@@ -609,10 +629,10 @@ impl ChartMotion {
             }
             None => f32::INFINITY,
         };
+        let mut bands = Vec::new();
         for piece in self.folding_away().unwrap_or_default() {
             let (r0, r1, alpha) = geometry.band_at(piece.depth);
-            let c = piece.color;
-            geometry.paint_band(window, r0, r1, piece.start, piece.end, hsla(c.hue.into_positive_degrees() / 360.0, c.saturation, c.lightness, c.alpha * alpha));
+            bands.push((None, Band { r0, r1, reach: r1, start: piece.start, end: piece.end, color: piece.color, alpha }));
         }
         let opening = Self::opening(self.fold.as_ref());
         // Outer rings first, so a ring sliding out from under its parent stays beneath it.
@@ -632,10 +652,10 @@ impl ChartMotion {
             if alpha < 0.01 {
                 continue;
             }
-            let c = motion.color;
-            let color = hsla(c.hue.into_positive_degrees() / 360.0, c.saturation, c.lightness, c.alpha * alpha);
-            geometry.paint_band(window, r0, r1.min(reach), start * fraction, end * fraction, color);
+            let band = Band { r0, r1, reach: r1.min(reach), start: start * fraction, end: end * fraction, color: motion.color, alpha };
+            bands.push((motion.current, band));
         }
+        bands
     }
 
     /// While the scan's chart is folding away: its pieces, where they are now.
@@ -678,7 +698,7 @@ fn opened(opening: &Opening, key: &Key, start: f32, end: f32) -> (f32, f32) {
 }
 
 /// Eases in and out with no jolt at either end (zero speed and acceleration).
-fn smootherstep(t: f32) -> f32 {
+pub(crate) fn smootherstep(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 }
@@ -872,6 +892,39 @@ mod tests {
     fn longest_in_order_keeps_the_most() {
         assert_eq!(longest_in_order(&[0.7, 0.0, 0.4]), [false, true, true]);
         assert_eq!(longest_in_order(&[0.0, 0.4, 0.4, 0.2, 0.9]), [true, true, true, false, true]);
+    }
+
+    /// What `paint` reports drawing: the latest layout's segments where they are, scaled by
+    /// the scan's fraction, in the colour they're painted, and nothing on its way out. While
+    /// the reveal uncovers a bar, it's still the whole bar, with how far it's uncovered.
+    #[test]
+    fn painting_reports_where_the_latest_layout_went() {
+        let geometry = Geometry::icicle(gpui::Bounds::new(gpui::point(gpui::px(0.), gpui::px(0.)), gpui::size(gpui::px(800.), gpui::px(600.))));
+        let mut motion = ChartMotion::default();
+        let mut t = Instant::now();
+        motion.retarget(1, &[key("a"), key("a/x"), key("b")], &[seg(0.0, 0.6, 1), seg(0.0, 0.3, 2), seg(0.6, 1.0, 1)], 0.5);
+        motion.step(t);
+        assert!(motion.bands(&geometry, |_, _, _| hsla(0., 0., 0.5, 1.)).is_empty(), "the reveal starts with nothing showing");
+        for _ in 0..2 {
+            t += Duration::from_millis(16);
+            motion.step(t);
+        }
+        let bands = motion.bands(&geometry, |i, _, _| hsla(i as f32 / 4.0, 0.5, 0.5, 1.));
+        let (_, a) = bands.iter().find(|(index, _)| *index == Some(0)).expect("a is coming into view");
+        assert!(a.reach < a.r1 && (a.r1 - geometry.rings[0].1).abs() < 0.1, "the whole bar, partly uncovered: {a:?}");
+        assert_eq!(a.color, hsla(0.0, 0.5, 0.5, 1.), "the colour it's painted, before its alpha");
+        run(&mut motion, &mut t, |_| {});
+        motion.retarget(2, &[key("a"), key("a/x")], &[seg(0.0, 1.0, 1), seg(0.0, 0.5, 2)], 0.5);
+        motion.step(t);
+        let bands = motion.bands(&geometry, |_, _, _| hsla(0., 0., 0.5, 1.));
+        assert_eq!(bands.iter().filter(|(index, _)| index.is_none()).count(), 1, "b, on its way out");
+        run(&mut motion, &mut t, |_| {});
+        let mut painted: Vec<(usize, f32, f32, f32)> =
+            motion.bands(&geometry, |_, _, _| hsla(0., 0., 0.5, 1.)).into_iter().filter_map(|(index, b)| Some((index?, b.start, b.end, b.r0))).collect();
+        painted.sort_by_key(|p| p.0);
+        assert_eq!(painted.len(), 2);
+        assert!(close(painted[0].1, 0.0) && close(painted[0].2, 0.5) && close(painted[1].2, 0.25), "{painted:?}");
+        assert!((painted[0].3 - geometry.rings[0].0).abs() < 0.1 && (painted[1].3 - geometry.rings[1].0).abs() < 0.1);
     }
 
     #[test]
