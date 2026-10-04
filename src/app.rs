@@ -1457,8 +1457,8 @@ impl Petal {
                             .min_w(px(24.))
                             .truncate()
                             // Short of room, the folders above give way before the one you're in.
-                            .when(is_last, |d| d.font_weight(FontWeight::SEMIBOLD).flex_shrink(1.))
-                            .when(!is_last, |d| d.text_color(rgb(MUTED)).flex_shrink(8.))
+                            .when(is_last, |d| d.font_weight(FontWeight::SEMIBOLD).flex_shrink_0())
+                            .when(!is_last, |d| d.text_color(rgb(MUTED)).flex_shrink(1.))
                             .cursor_pointer()
                             .hover(|s| s.bg(rgb(CARD_HOVER)))
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
