@@ -15,8 +15,9 @@
 //!   fading, beneath what grows into their place.
 //! - Changing the folder in focus moves a camera: one affine map for the whole chart, so the
 //!   folder's tile opens out to fill the chart while its contents fade in over it (or, going
-//!   up, the chart shrinks back into the folder's tile as that fades in over it). Painting is
-//!   clipped to the tile area, which tiles leave and enter by.
+//!   up, the chart shrinks back into the folder's tile as that fades in over it). What's
+//!   underneath stays opaque until what's on top has all but faded in, so the backdrop never
+//!   shows through. Painting is clipped to the tile area, which tiles leave and enter by.
 //! - When the scan finishes, its chart fades away while the results are revealed in its place
 //!   (`fold`); the scan's tiles are in first-seen order and the results' largest first, so
 //!   morphing between them would only be a shuffle.
@@ -47,6 +48,10 @@ const REVEAL_SECONDS: f32 = REVEAL_EACH + REVEAL_STAGGER;
 const REVEAL_FROM: f32 = 0.6;
 /// How long the chart as drawn takes to fade away in a fold.
 const FADE_SECONDS: f32 = 0.35;
+/// In a zoom, how far the arriving tiles fade in before those leaving start to fade out.
+/// Fading both at once would let the backdrop show through (a quarter of it halfway), so the
+/// ones leaving stay opaque underneath until there's little left to show through.
+const HOLD_UNTIL: f32 = 0.9;
 
 /// The chart's two parts within the canvas: the focus folder's bar (clicking it goes up a
 /// level) and the area the tiles fill. Both sit below the strip the app keeps for its hover
@@ -299,6 +304,9 @@ struct TileMotion {
     current: Option<usize>,
     /// Colour last drawn with, for tiles that are on their way out.
     color: Hsla,
+    /// On its way out in a zoom, and kept opaque until the arriving tiles have faded in over
+    /// it (`HOLD_UNTIL`), so only one layer is ever see-through at a time.
+    held: bool,
 }
 
 impl TileMotion {
@@ -562,6 +570,7 @@ impl TreemapMotion {
                 motion.turns[0].target = segment.start;
                 motion.turns[1].target = segment.end;
                 motion.alpha.target = 1.0;
+                motion.held = false;
                 motion.current = Some(i);
                 continue;
             }
@@ -579,9 +588,12 @@ impl TreemapMotion {
                 let (cx, cy) = target.center();
                 (moving(Rect::point(cx, cy), target), at_rest, Spring::still(0.0, 1.0))
             };
-            self.tiles.insert(key.clone(), TileMotion { edges, turns, alpha, current: Some(i), color: hsla(0., 0., 0., 0.) });
+            self.tiles.insert(key.clone(), TileMotion { edges, turns, alpha, current: Some(i), color: hsla(0., 0., 0., 0.), held: false });
         }
         // Tiles that are gone: carried off by the camera, or shrinking away where they were.
+        // The camera's stay opaque while what arrives fades in over them: the folder zoomed
+        // into opens out beneath its contents, and going up, the old contents shrink away
+        // beneath the folder's tile.
         for motion in self.tiles.values_mut().filter(|m| m.current.is_none()) {
             let target = motion.target();
             let to = match camera {
@@ -592,7 +604,11 @@ impl TreemapMotion {
                 }
             };
             motion.aim(to);
-            motion.alpha.target = 0.0;
+            // (One already fading out carries on fading.)
+            motion.held = camera.is_some() && motion.alpha.target > 0.0;
+            if !motion.held {
+                motion.alpha.target = 0.0;
+            }
         }
         // Biggest first, for the reveal.
         let weight = |i: usize| segments[i].end - segments[i].start;
@@ -630,12 +646,24 @@ impl TreemapMotion {
         if self.fade.is_none() && self.reveal.is_none() {
             self.folded = false;
         }
-        self.tiles.retain(|_, motion| {
+        for motion in self.tiles.values_mut() {
             motion.step(dt);
+        }
+        // Tiles held in a zoom start to fade once what's arriving has all but faded in (or
+        // straight away if nothing is: an empty folder).
+        let arrived = self.tiles.values().filter(|m| m.current.is_some()).map(|m| m.alpha.x).fold(1.0f32, f32::min);
+        if arrived >= HOLD_UNTIL {
+            for motion in self.tiles.values_mut().filter(|m| m.held) {
+                motion.held = false;
+                motion.alpha.target = 0.0;
+            }
+        }
+        self.tiles.retain(|_, motion| {
             let settled = motion.settled();
-            moving |= !settled;
-            // Departed tiles go once they've shrunk away, faded out, or come to rest.
-            motion.current.is_some() || (!settled && motion.rect().visible() && motion.alpha.x >= 0.01)
+            moving |= !settled || motion.held;
+            // Departed tiles go once they've shrunk away, faded out, or come to rest; held
+            // ones wait to fade.
+            motion.current.is_some() || motion.held || (!settled && motion.rect().visible() && motion.alpha.x >= 0.01)
         });
         moving
     }
@@ -975,7 +1003,7 @@ mod tests {
             let (x, y) = Rect::of(r).center();
             point(px(x), px(y))
         };
-        // The middle of the folder is the folder, not what's inside it.
+        // A deeper segment passed in is never hit: the middle of the folder's tile is the folder.
         assert_eq!(hit_test(&tiles, bar, middle(tiles[0].unwrap())), Some(Hit::Segment(0)));
         assert_eq!(hit_test(&tiles, bar, middle(tiles[2].unwrap())), Some(Hit::Segment(2)));
         assert_eq!(hit_test(&tiles, bar, middle(bar)), Some(Hit::Center));
@@ -1097,6 +1125,40 @@ mod tests {
         assert!(frames < 75, "took {frames} frames");
         assert!(!motion.tiles.contains_key(&key("a/x")));
         assert!(at_targets(&motion));
+    }
+
+    /// How opaque the chart is at a point: every tile over it, layered.
+    fn coverage(motion: &TreemapMotion, x: f32, y: f32) -> f32 {
+        1.0 - motion.placed().iter().filter(|p| p.rect.contains(x, y)).map(|p| 1.0 - p.alpha).product::<f32>()
+    }
+
+    /// Zooming in or out never lets the backdrop show through: what leaves stays opaque
+    /// beneath what arrives until that has all but faded in.
+    #[test]
+    fn zooming_never_shows_the_backdrop_through_the_folder() {
+        let mut motion = TreemapMotion::default();
+        let mut t = Instant::now();
+        let (keys, segments) = root();
+        motion.retarget(1, &keys, &segments, area(), 1.0);
+        run(&mut motion, &mut t, |_| {});
+
+        motion.zoom(root_key(), key("a"));
+        let (keys, segments) = in_a();
+        motion.retarget(2, &keys, &segments, area(), 1.0);
+        let (x, y) = Rect::of(motion.layout[0].unwrap()).center();
+        let mut worst = f32::INFINITY;
+        let frames = run(&mut motion, &mut t, |m| worst = worst.min(coverage(m, x, y)));
+        assert!(worst >= HOLD_UNTIL - 0.01, "zooming in, the chart is only {worst} opaque at its thinnest");
+        assert!(frames < 75 && !motion.tiles.contains_key(&key("a")), "in took {frames} frames");
+
+        motion.zoom(key("a"), root_key());
+        let (keys, segments) = root();
+        motion.retarget(3, &keys, &segments, area(), 1.0);
+        let (x, y) = motion.tiles[&key("a/x")].target().center();
+        let mut worst = f32::INFINITY;
+        let frames = run(&mut motion, &mut t, |m| worst = worst.min(coverage(m, x, y)));
+        assert!(worst >= HOLD_UNTIL - 0.01, "zooming out, the chart is only {worst} opaque at its thinnest");
+        assert!(frames < 75 && !motion.tiles.contains_key(&key("a/x")), "out took {frames} frames");
     }
 
     /// Jumping more than one level (along the breadcrumbs, say) zooms by the folder on the

@@ -74,8 +74,7 @@ pub enum ChartType {
 
 impl ChartType {
     /// The chart's segments for the folder `focus`: as many levels as the sunburst and icicle
-    /// have rings and columns for, and just the one for the treemap, which shows one level at
-    /// a time. Keys, labels, swatches and categories are all made from these, so they line up
+    /// show, and just the one for the treemap, which shows one level at a time. Keys, labels, swatches and categories are all made from these, so they line up
     /// whichever it is.
     fn layout(self, tree: &Tree, focus: usize) -> Vec<Segment> {
         match self {
@@ -186,9 +185,6 @@ struct LiveView {
     labels: Vec<(SharedString, SharedString)>,
     /// Unique per layout, so the animation knows when to retarget.
     id: u64,
-    /// The chart it's laid out for (`ChartType::layout`), so a change of chart can tell it's
-    /// out of date.
-    chart: ChartType,
 }
 
 static NEXT_LAYOUT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -229,14 +225,13 @@ impl LiveView {
             keys: Vec::new(),
             labels: Vec::new(),
             id: 0,
-            chart,
         };
-        view.lay_out();
+        view.lay_out(chart);
         view
     }
 
-    fn lay_out(&mut self) {
-        let segments = self.chart.layout(&self.tree, Tree::ROOT);
+    fn lay_out(&mut self, chart: ChartType) {
+        let segments = chart.layout(&self.tree, Tree::ROOT);
         self.swatches = segments
             .iter()
             .filter_map(|s| match s.target {
@@ -838,9 +833,8 @@ impl Petal {
                     let Screen::Scanning(scanning) = &mut this.screen else { return false };
                     let items = scanning.progress.files.load(Ordering::Relaxed) + scanning.progress.dirs.load(Ordering::Relaxed);
                     scanning.eta.update(clock::since(scanning.started).as_secs_f64(), items);
-                    // One laid out for a different chart is redone straight away, not on the next refresh.
-                    let stale = scanning.live.as_ref().is_none_or(|live| live.chart != chart);
-                    if stale || clock::since(scanning.last_snapshot) >= LIVE_REFRESH {
+                    // (A change of chart takes its own snapshot straight away, in `set_chart`.)
+                    if scanning.live.is_none() || clock::since(scanning.last_snapshot) >= LIVE_REFRESH {
                         scanning.snapshot(chart);
                     }
                     true
