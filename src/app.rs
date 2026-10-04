@@ -27,9 +27,10 @@ use crate::motion;
 use crate::scan::{self, Kind, Progress, Tree, Volume, format_count, format_size};
 use crate::sunburst::{self, Geometry, Hit, Segment, Target};
 use crate::trashing;
+use crate::treemap::{self, TreemapMotion};
 use crate::watch;
 
-actions!(petal, [GoUp, OpenFolder, Rescan, StartOver]);
+actions!(petal, [GoUp, OpenFolder, Rescan, StartOver, ShowSunburst, ShowIcicle, ShowTreemap]);
 
 const BG: u32 = 0x1c1d21;
 const PANEL: u32 = 0x232529;
@@ -54,6 +55,18 @@ enum ColorBy {
     Folder,
     /// By what things are: apps, caches, photos… (see `classify`).
     Kind,
+}
+
+/// How the chart is drawn. All three show the same layout (`sunburst::layout`), so colours,
+/// hover and zoom mean the same thing in each.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChartType {
+    /// Rings round the folder in focus.
+    Sunburst,
+    /// The sunburst unrolled into columns, one per level, so names fit (see `Geometry::icicle`).
+    Icicle,
+    /// Nested rectangles sized by area, every level at once (see `treemap`).
+    Treemap,
 }
 
 /// How long a notice ("Copied …") stays up.
@@ -121,8 +134,9 @@ struct Scanning {
     last_snapshot: Instant,
     chart_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     eta: eta::Eta,
-    /// Segments ease between snapshots instead of jumping.
+    /// Segments ease between snapshots instead of jumping (`tiles` when it's a treemap).
     motion: Rc<std::cell::RefCell<motion::ChartMotion>>,
+    tiles: Rc<std::cell::RefCell<TreemapMotion>>,
     _tasks: [Task<()>; 2],
 }
 
@@ -141,6 +155,8 @@ struct LiveView {
     settled_at: HashMap<usize, Instant>,
     /// Each segment's identity (folder path), aligned with `segments`, for smooth motion.
     keys: Vec<motion::Key>,
+    /// Each segment's name and size, aligned with `segments`, for the icicle's and treemap's labels.
+    labels: Vec<(SharedString, SharedString)>,
     /// Unique per layout, so the animation knows when to retarget.
     id: u64,
 }
@@ -180,6 +196,7 @@ impl LiveView {
             pending,
             settled_at,
             keys: Vec::new(),
+            labels: Vec::new(),
             id: 0,
         };
         view.lay_out();
@@ -202,6 +219,12 @@ impl LiveView {
                 Target::Small { first, .. } => motion::Key::Small(path_to(&self.tree, first)),
             })
             .collect();
+        // Honest sizes, as in the list: folders still being counted show a lower bound.
+        let (tree, done) = (&self.tree, &self.done);
+        self.labels = segment_labels(tree, Tree::ROOT, &segments, |ix| {
+            let node = &tree.nodes[ix];
+            if node.kind == Kind::Dir && !done[ix] { format!("≥ {}", format_size(node.size)) } else { format_size(node.size) }
+        });
         self.segments = Rc::new(segments);
         self.id = NEXT_LAYOUT_ID.fetch_add(1, Ordering::Relaxed);
     }
@@ -221,6 +244,18 @@ fn resolve_path(tree: &Tree, path: &[SharedString]) -> usize {
         }
     }
     at
+}
+
+/// Each segment's name and size, for labels on the chart. `size` gives a node's size as shown.
+fn segment_labels(tree: &Tree, focus: usize, segments: &[Segment], size: impl Fn(usize) -> String) -> Vec<(SharedString, SharedString)> {
+    let total = tree.nodes[focus].size as f64;
+    segments
+        .iter()
+        .map(|s| match s.target {
+            Target::Node(ix) => (tree.nodes[ix].name.clone(), size(ix).into()),
+            Target::Small { .. } => ("Smaller objects".into(), format_size(((s.end - s.start) as f64 * total) as u64).into()),
+        })
+        .collect()
 }
 
 /// Folder names from the root down to `ix` (excluding the root itself).
@@ -245,8 +280,13 @@ struct Results {
     keys: Rc<Vec<motion::Key>>,
     /// Unique per layout, so the animation knows when to retarget.
     layout_id: u64,
-    /// The chart morphs between layouts (carried over from the scan's live chart).
+    /// Each segment's name and size, aligned with `segments`, for the icicle's and treemap's labels.
+    labels: Rc<Vec<(SharedString, SharedString)>>,
+    /// The chart morphs between layouts (carried over from the scan's live chart); `tiles`
+    /// does the same for the treemap.
     motion: Rc<std::cell::RefCell<motion::ChartMotion>>,
+    tiles: Rc<std::cell::RefCell<TreemapMotion>>,
+    chart: ChartType,
     chart_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     collector: Vec<usize>,
     list_scroll: UniformListScrollHandle,
@@ -292,7 +332,7 @@ struct Trashed {
 }
 
 impl Results {
-    fn new(tree: Tree, findings: Vec<Finding>, elapsed: Duration, requested_root: PathBuf, color_by: ColorBy) -> Self {
+    fn new(tree: Tree, findings: Vec<Finding>, elapsed: Duration, requested_root: PathBuf, color_by: ColorBy, chart: ChartType) -> Self {
         let mut results = Self {
             tree,
             focus: Tree::ROOT,
@@ -302,7 +342,10 @@ impl Results {
             list_hover: None,
             keys: Rc::default(),
             layout_id: 0,
+            labels: Rc::default(),
             motion: Rc::default(),
+            tiles: Rc::default(),
+            chart,
             chart_bounds: Rc::default(),
             collector: Vec::new(),
             list_scroll: UniformListScrollHandle::new(),
@@ -355,6 +398,8 @@ impl Results {
                 })
                 .collect(),
         );
+        let tree = &self.tree;
+        self.labels = Rc::new(segment_labels(tree, self.focus, &segments, |ix| format_size(tree.nodes[ix].size)));
         self.segments = Rc::new(segments);
         self.layout_id = NEXT_LAYOUT_ID.fetch_add(1, Ordering::Relaxed);
     }
@@ -388,7 +433,13 @@ impl Results {
         if self.tree.nodes[ix].kind != Kind::Dir || ix == self.focus {
             return;
         }
-        self.motion.borrow_mut().zoom(motion::Camera::between(&self.tree, self.focus, ix));
+        match self.chart {
+            ChartType::Treemap => {
+                let (from, to) = (path_to(&self.tree, self.focus), path_to(&self.tree, ix));
+                self.tiles.borrow_mut().zoom(motion::Key::Node(from), motion::Key::Node(to));
+            }
+            ChartType::Sunburst | ChartType::Icicle => self.motion.borrow_mut().zoom(motion::Camera::between(&self.tree, self.focus, ix)),
+        }
         self.focus = ix;
         self.chart_hover = None;
         self.list_hover = None;
@@ -564,6 +615,7 @@ pub struct Petal {
     _access_watch: Option<Task<()>>,
     /// Kept here rather than on the results, so a rescan keeps the user's choice.
     color_by: ColorBy,
+    chart: ChartType,
 }
 
 impl Petal {
@@ -584,6 +636,7 @@ impl Petal {
             access,
             _access_watch: None,
             color_by: ColorBy::Folder,
+            chart: ChartType::Sunburst,
         };
         if access == Access::Missing {
             this._access_watch = Some(this.watch_access(cx));
@@ -702,14 +755,18 @@ impl Petal {
                 this.update(cx, |this, cx| {
                     if !progress.cancelled.load(Ordering::Relaxed) {
                         // Carry the chart on from where it is.
-                        let motion = match &this.screen {
-                            Screen::Scanning(scanning) => scanning.motion.clone(),
+                        let (motion, tiles) = match &this.screen {
+                            Screen::Scanning(scanning) => (scanning.motion.clone(), scanning.tiles.clone()),
                             _ => Default::default(),
                         };
-                        let mut results = Results::new(tree, findings, clock::since(started), root_for_results, this.color_by);
+                        let mut results = Results::new(tree, findings, clock::since(started), root_for_results, this.color_by, this.chart);
                         // The results are sorted by size, unlike the scan's chart: fold one away and open the other.
-                        motion.borrow_mut().fold();
+                        match this.chart {
+                            ChartType::Treemap => tiles.borrow_mut().fold(),
+                            ChartType::Sunburst | ChartType::Icicle => motion.borrow_mut().fold(),
+                        }
                         results.motion = motion;
+                        results.tiles = tiles;
                         results.banner = Some(clock::now());
                         results.watch = watch::Watch::start(&results.requested_root, since);
                         let id = results.id;
@@ -773,6 +830,7 @@ impl Petal {
             chart_bounds: Rc::default(),
             eta: eta::Eta::default(),
             motion: Rc::default(),
+            tiles: Rc::default(),
             _tasks: [scan_task, ticker],
         });
         cx.notify();
@@ -1034,6 +1092,27 @@ impl Petal {
         cx.notify();
     }
 
+    fn set_chart(&mut self, chart: ChartType, cx: &mut Context<Self>) {
+        if self.chart == chart {
+            return;
+        }
+        self.chart = chart;
+        // Start the chart afresh, so it's revealed the way a new chart is rather than
+        // morphing from a different shape.
+        let (motion, tiles) = match &mut self.screen {
+            Screen::Scanning(scanning) => (&scanning.motion, &scanning.tiles),
+            Screen::Results(r) => {
+                r.chart = chart;
+                r.chart_hover = None;
+                (&r.motion, &r.tiles)
+            }
+            Screen::Start(_) => return cx.notify(),
+        };
+        *motion.borrow_mut() = Default::default();
+        *tiles.borrow_mut() = Default::default();
+        cx.notify();
+    }
+
     fn set_chart_hover(&mut self, hit: Option<Hit>, cx: &mut Context<Self>) {
         if let Some(r) = self.results() {
             if r.chart_hover != hit {
@@ -1220,6 +1299,9 @@ impl Render for Petal {
             .on_action(cx.listener(Self::rescan))
             .on_action(cx.listener(Self::start_over))
             .on_action(cx.listener(Self::go_up))
+            .on_action(cx.listener(|this, _: &ShowSunburst, _, cx| this.set_chart(ChartType::Sunburst, cx)))
+            .on_action(cx.listener(|this, _: &ShowIcicle, _, cx| this.set_chart(ChartType::Icicle, cx)))
+            .on_action(cx.listener(|this, _: &ShowTreemap, _, cx| this.set_chart(ChartType::Treemap, cx)))
             .size_full()
             .flex()
             .flex_col()
@@ -1387,6 +1469,7 @@ impl Petal {
                 }
                 bar = bar.child(crumbs).child(div().flex_1());
                 bar = bar
+                    .child(chart_toggle(self.chart, cx))
                     .child(color_toggle(r.color_by, cx))
                     .child(
                         div().text_xs().text_color(rgb(MUTED)).flex_none().child(if r.out_of_date {
@@ -1406,7 +1489,10 @@ impl Petal {
                             .on_click(cx.listener(|this, _, window, cx| this.start_over(&StartOver, window, cx))),
                     );
             }
-            _ => {
+            Screen::Scanning(_) => {
+                bar = bar.child(div().font_weight(FontWeight::SEMIBOLD).child("Petal")).child(div().flex_1()).child(chart_toggle(self.chart, cx));
+            }
+            Screen::Start(_) => {
                 bar = bar.child(div().font_weight(FontWeight::SEMIBOLD).child("Petal"));
             }
         }
@@ -1664,7 +1750,11 @@ impl Petal {
                 ),
         };
         let label_width = scanning.chart_bounds.get().map(|b| Geometry::new(b).inner_radius * 1.7).unwrap_or(140.);
+        let chart_type = self.chart;
+        let tiles = scanning.tiles.clone();
         let paint_view = view.clone();
+        // The treemap's focus bar names what's being scanned.
+        let focus = view.as_ref().map(|v| (v.tree.nodes[Tree::ROOT].name.clone(), SharedString::from(size_label(v, Tree::ROOT)), false));
 
         let chart = div()
             .flex_1()
@@ -1673,20 +1763,20 @@ impl Petal {
             .child(
                 canvas(
                     move |bounds, _, _| bounds_cell.set(Some(bounds)),
-                    move |bounds, _, window, _| {
-                        let geometry = Geometry::new(bounds);
-                        geometry.paint_disc(window, geometry.outer_radius() + 6.0, to_hsla(0x18191c));
-                        let Some(view) = paint_view else { return };
-                        let pulse = 0.22 + 0.04 * (clock::since(started).as_secs_f32() * 3.0).sin();
-                        let mut motion = motion.borrow_mut();
-                        motion.retarget(view.id as usize, &view.keys, &view.segments, fraction);
-                        motion.step(clock::now());
-                        let fraction = motion.fraction();
-                        motion.paint(window, &geometry, |i, start, end| {
+                    move |bounds, _, window, cx| {
+                        window.request_animation_frame();
+                        let Some(view) = paint_view else {
+                            paint_backdrop(chart_type, bounds, window);
+                            return;
+                        };
+                        let pulse = gpui::hsla(0.0, 0.0, 0.22 + 0.04 * (clock::since(started).as_secs_f32() * 3.0).sin(), 1.0);
+                        let layout = ChartLayout { id: view.id, keys: &view.keys, segments: &view.segments, labels: &view.labels };
+                        let motions = ChartMotions { rings: &motion, tiles: &tiles };
+                        paint_chart(chart_type, bounds, &layout, fraction, Some(pulse), to_hsla(0x2b2d33), focus, motions, window, cx, |i, start, end| {
                             // Hue follows the animated position, so colours shift smoothly too.
                             let segment = &Segment { start, end, ..view.segments[i] };
                             match segment.target {
-                                Target::Node(ix) if Some(ix) == view.pending => gpui::hsla(0.0, 0.0, pulse, 1.0),
+                                Target::Node(ix) if Some(ix) == view.pending => pulse,
                                 Target::Node(ix) => {
                                     let full = sunburst::base_color(segment);
                                     // Folders still being counted are drawn muted, and ease into full
@@ -1708,35 +1798,11 @@ impl Petal {
                                 Target::Small { .. } => sunburst::base_color(segment),
                             }
                         });
-                        drop(motion);
-                        if fraction < 0.9999 {
-                            geometry.paint_sector(window, 1, fraction, 1.0, gpui::hsla(0.0, 0.0, pulse, 1.0));
-                        }
-                        window.request_animation_frame();
-                        geometry.paint_disc(window, geometry.inner_radius - 1.0, to_hsla(0x2b2d33));
                     },
                 )
                 .size_full(),
             )
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .max_w(px(label_width))
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .gap_0p5()
-                            .child(div().max_w_full().text_base().font_weight(FontWeight::SEMIBOLD).truncate().child(title))
-                            .children(lines.into_iter().map(|line| div().text_xs().text_color(rgb(MUTED)).child(line))),
-                    ),
-            );
+            .child(chart_label(chart_type, label_width, title.into(), lines));
 
         div().size_full().flex().child(sidebar).child(chart)
     }
@@ -2325,40 +2391,42 @@ impl Petal {
             .unwrap_or(140.);
 
         let segments = r.segments.clone();
-        let (keys, layout_id, motion) = (r.keys.clone(), r.layout_id, r.motion.clone());
+        let (keys, labels, layout_id) = (r.keys.clone(), r.labels.clone(), r.layout_id);
+        let (motion, tiles, chart_type) = (r.motion.clone(), r.tiles.clone(), r.chart);
         // Colouring by folder takes the hue from the angle, so it follows the motion.
         let hue_follows = r.color_by == ColorBy::Folder;
         let bounds_cell = r.chart_bounds.clone();
         let entity = cx.entity().downgrade();
+        let focus_node = &tree.nodes[r.focus];
+        let focus = Some((focus_node.name.clone(), SharedString::from(format_size(focus_node.size)), center_hovered));
+        // The icicle and treemap leave their legend room below them; the sunburst's sits in a corner.
+        let legend = (r.color_by == ColorBy::Kind).then(|| render_legend(r, chart_type != ChartType::Sunburst, cx));
 
         div()
             .flex_1()
             .h_full()
             .relative()
+            .flex()
+            .flex_col()
             .child(
                 canvas(
                     move |bounds, window, _| {
                         bounds_cell.set(Some(bounds));
                         window.insert_hitbox(bounds, HitboxBehavior::Normal)
                     },
-                    move |bounds, hitbox, window, _| {
-                        let geometry = Geometry::new(bounds);
-                        geometry.paint_disc(window, geometry.outer_radius() + 6.0, to_hsla(0x18191c));
-                        let mut motion = motion.borrow_mut();
-                        motion.retarget(layout_id as usize, &keys, &segments, 1.0);
-                        if motion.step(clock::now()) {
-                            window.request_animation_frame();
-                        }
-                        motion.paint(window, &geometry, |i, start, end| {
+                    move |bounds, hitbox, window, cx| {
+                        let center = if center_hovered { to_hsla(0x3a3d44) } else { to_hsla(0x2b2d33) };
+                        let layout = ChartLayout { id: layout_id, keys: &keys, segments: &segments, labels: &labels };
+                        let motions = ChartMotions { rings: &motion, tiles: &tiles };
+                        let frame = paint_chart(chart_type, bounds, &layout, 1.0, None, center, focus, motions, window, cx, |i, start, end| {
                             let color = colors[i];
                             if hue_follows { gpui::hsla(((start + end) / 2.0).rem_euclid(1.0), color.saturation, color.lightness, color.alpha) } else { color }
                         });
-                        let folding = motion.folding();
-                        drop(motion);
-                        let center = if center_hovered { to_hsla(0x3a3d44) } else { to_hsla(0x2b2d33) };
-                        geometry.paint_disc(window, geometry.inner_radius - 1.0, center);
+                        if frame.moving {
+                            window.request_animation_frame();
+                        }
                         // Mid-fold, nothing is where it's drawn: leave the pointer be until it's done.
-                        if folding {
+                        if frame.folding {
                             return;
                         }
 
@@ -2366,17 +2434,14 @@ impl Petal {
                             window.set_cursor_style(CursorStyle::PointingHand, &hitbox);
                         }
 
-                        let segments_for_move = segments.clone();
+                        let hits = Rc::new(frame.hits);
+                        let (hits_for_move, segments_for_move) = (hits.clone(), segments.clone());
                         let entity_for_move = entity.clone();
                         window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
                             if phase != DispatchPhase::Bubble {
                                 return;
                             }
-                            let hit = if bounds.contains(&event.position) {
-                                geometry.hit_test(event.position, &segments_for_move)
-                            } else {
-                                None
-                            };
+                            let hit = if bounds.contains(&event.position) { hits_for_move.hit(event.position, &segments_for_move) } else { None };
                             entity_for_move.update(cx, |this, cx| this.set_chart_hover(hit, cx)).ok();
                         });
                         let segments_for_click = segments.clone();
@@ -2388,43 +2453,18 @@ impl Petal {
                             {
                                 return;
                             }
-                            if let Some(hit) = geometry.hit_test(event.position, &segments_for_click) {
+                            if let Some(hit) = hits.hit(event.position, &segments_for_click) {
                                 entity_for_click.update(cx, |this, cx| this.chart_click(hit, cx)).ok();
                             }
                         });
                     },
                 )
-                .size_full(),
+                .flex_1()
+                .min_h_0()
+                .w_full(),
             )
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .max_w(px(label_width))
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .gap_0p5()
-                            .child(
-                                div()
-                                    .max_w_full()
-                                    .text_base()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .truncate()
-                                    .child(title),
-                            )
-                            .children(subtitle.lines().map(|line| {
-                                div().text_color(rgb(MUTED)).text_xs().child(line.to_string())
-                            })),
-                    ),
-            )
-            .when(r.color_by == ColorBy::Kind, |d| d.child(render_legend(r, cx)))
+            .child(chart_label(chart_type, label_width, title, subtitle.lines().map(str::to_string).collect()))
+            .children(legend)
             .when(r.banner.is_some(), |d| {
                 // The "done" moment: what the scan found, in one line.
                 let total = tree.nodes[Tree::ROOT].size;
@@ -2467,22 +2507,176 @@ impl Petal {
     }
 }
 
-/// "Colour: Folder | Kind" in the toolbar.
-fn color_toggle(current: ColorBy, cx: &mut Context<Petal>) -> impl IntoElement {
-    let option = |id: &'static str, label: &'static str, value: ColorBy, cx: &mut Context<Petal>| {
-        let selected = current == value;
+/// A layout as a chart canvas paints it: the segments, with their keys (for motion) and
+/// labels (for the icicle and treemap), all aligned.
+struct ChartLayout<'a> {
+    id: u64,
+    keys: &'a [motion::Key],
+    segments: &'a [Segment],
+    labels: &'a [(SharedString, SharedString)],
+}
+
+/// The chart's motion: `rings` for the sunburst and icicle, `tiles` for the treemap.
+#[derive(Clone, Copy)]
+struct ChartMotions<'a> {
+    rings: &'a std::cell::RefCell<motion::ChartMotion>,
+    tiles: &'a std::cell::RefCell<TreemapMotion>,
+}
+
+/// Where things were painted, for the pointer.
+enum ChartHits {
+    Rings(Geometry),
+    /// The treemap's tiles, and its focus bar.
+    Tiles(Vec<treemap::Tile>, Bounds<Pixels>),
+}
+
+impl ChartHits {
+    fn hit(&self, position: gpui::Point<Pixels>, segments: &[Segment]) -> Option<Hit> {
+        match self {
+            ChartHits::Rings(geometry) => geometry.hit_test(position, segments),
+            ChartHits::Tiles(tiles, bar) => treemap::hit_test(tiles, *bar, position),
+        }
+    }
+}
+
+struct ChartFrame {
+    hits: ChartHits,
+    /// Still moving: paint another frame.
+    moving: bool,
+    /// What's drawn isn't where things are (see `ChartMotion::folding`).
+    folding: bool,
+}
+
+/// The plate the chart sits on.
+const CHART_BACKDROP: u32 = 0x18191c;
+
+/// Just the plate, for before there's anything to chart.
+fn paint_backdrop(chart: ChartType, bounds: Bounds<Pixels>, window: &mut Window) {
+    match chart {
+        ChartType::Sunburst => Geometry::new(bounds).paint_backdrop(window, to_hsla(CHART_BACKDROP)),
+        ChartType::Icicle => Geometry::icicle(bounds).paint_backdrop(window, to_hsla(CHART_BACKDROP)),
+        ChartType::Treemap => paint_treemap_backdrop(treemap::content_area(bounds).1, window),
+    }
+}
+
+fn paint_treemap_backdrop(area: Bounds<Pixels>, window: &mut Window) {
+    window.paint_quad(gpui::fill(area.dilate(px(6.)), to_hsla(CHART_BACKDROP)).corner_radii(px(8.)));
+}
+
+/// Move the chart on a frame and paint it, as whichever type it is: what the scan's and the
+/// results' canvases share. `fraction` is the share of the chart scanned so far, with
+/// `pending` the colour of the rest; `center` colours the sunburst's centre and the icicle's
+/// first column (both mean "the folder in focus"), and `focus` titles the treemap's focus
+/// bar (name, size, hovered). `color` is as for `ChartMotion::paint`.
+#[allow(clippy::too_many_arguments)]
+fn paint_chart(
+    chart: ChartType,
+    bounds: Bounds<Pixels>,
+    layout: &ChartLayout,
+    fraction: f32,
+    pending: Option<Hsla>,
+    center: Hsla,
+    focus: Option<(SharedString, SharedString, bool)>,
+    motions: ChartMotions,
+    window: &mut Window,
+    cx: &mut App,
+    color: impl FnMut(usize, f32, f32) -> Hsla,
+) -> ChartFrame {
+    let label = |i: usize| layout.labels.get(i).cloned();
+    match chart {
+        ChartType::Sunburst | ChartType::Icicle => {
+            let geometry = if chart == ChartType::Icicle { Geometry::icicle(bounds) } else { Geometry::new(bounds) };
+            geometry.paint_backdrop(window, to_hsla(CHART_BACKDROP));
+            let mut motion = motions.rings.borrow_mut();
+            motion.retarget(layout.id as usize, layout.keys, layout.segments, fraction);
+            let moving = motion.step(clock::now());
+            let fraction = motion.fraction();
+            let painted = motion.paint(window, &geometry, color);
+            let folding = motion.folding();
+            drop(motion);
+            if let Some(pending) = pending.filter(|_| fraction < 0.9999) {
+                geometry.paint_sector(window, 1, fraction, 1.0, pending);
+            }
+            // Labels would only flicker as the fold resizes everything under them.
+            if chart == ChartType::Icicle && !folding {
+                sunburst::paint_icicle_labels(&geometry, &painted, label, window, cx);
+            }
+            geometry.paint_center(window, center);
+            ChartFrame { hits: ChartHits::Rings(geometry), moving, folding }
+        }
+        ChartType::Treemap => {
+            let (bar, area) = treemap::content_area(bounds);
+            paint_treemap_backdrop(area, window);
+            let mut tiles = motions.tiles.borrow_mut();
+            tiles.retarget(layout.id as usize, layout.keys, layout.segments, area, fraction);
+            let moving = tiles.step(clock::now());
+            let fraction = tiles.fraction();
+            let painted = tiles.paint(window, color);
+            let folding = tiles.folding();
+            let hits = ChartHits::Tiles(tiles.tiles().to_vec(), bar);
+            drop(tiles);
+            if let Some(pending) = pending.filter(|_| fraction < 0.9999) {
+                // The tiles are squeezed to the left by `fraction`; the rest is still to come.
+                let x = area.left() + area.size.width * fraction + px(1.);
+                let rest = Bounds::from_corners(gpui::point(x.min(area.right()), area.top()), area.bottom_right());
+                window.paint_quad(gpui::fill(rest, pending).corner_radii(px(2.)));
+            }
+            if !folding {
+                treemap::paint_labels(&painted, label, window, cx);
+            }
+            if let Some((title, size, hovered)) = focus {
+                treemap::paint_focus_bar(bar, &title, &size, hovered, window, cx);
+            }
+            ChartFrame { hits, moving, folding }
+        }
+    }
+}
+
+/// The label over the chart: in the middle of a sunburst (at most `max_width` across), or in
+/// a strip across the top of the icicle and treemap, which leave room for it there.
+fn chart_label(chart: ChartType, max_width: f32, title: SharedString, lines: Vec<String>) -> gpui::Div {
+    if chart != ChartType::Sunburst {
+        return div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(52.))
+            .px(px(18.))
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(div().min_w_0().text_base().font_weight(FontWeight::SEMIBOLD).truncate().child(title))
+            .child(div().flex_none().text_xs().text_color(rgb(MUTED)).child(lines.join("  ·  ")));
+    }
+    div().absolute().inset_0().flex().flex_col().items_center().justify_center().child(
         div()
-            .id(id)
-            .px_2()
-            .py_0p5()
-            .rounded_md()
-            .cursor_pointer()
-            .when(selected, |d| d.bg(rgb(CARD_HOVER)).text_color(rgb(TEXT)))
-            .when(!selected, |d| d.text_color(rgb(MUTED)).hover(|s| s.text_color(rgb(TEXT))))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(move |this, _, _, cx| this.set_color_by(value, cx)))
-            .child(label)
-    };
+            .max_w(px(max_width))
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_0p5()
+            .child(div().max_w_full().text_base().font_weight(FontWeight::SEMIBOLD).truncate().child(title))
+            .children(lines.into_iter().map(|line| div().text_xs().text_color(rgb(MUTED)).child(line))),
+    )
+}
+
+/// One choice in a toolbar toggle ("Colour: Folder | Kind").
+fn toggle_option(id: &'static str, label: &'static str, selected: bool) -> Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .px_2()
+        .py_0p5()
+        .rounded_md()
+        .cursor_pointer()
+        .when(selected, |d| d.bg(rgb(CARD_HOVER)).text_color(rgb(TEXT)))
+        .when(!selected, |d| d.text_color(rgb(MUTED)).hover(|s| s.text_color(rgb(TEXT))))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(label)
+}
+
+/// A labelled row of `toggle_option`s.
+fn toggle(label: &'static str) -> gpui::Div {
     div()
         .flex()
         .flex_none()
@@ -2493,26 +2687,37 @@ fn color_toggle(current: ColorBy, cx: &mut Context<Petal>) -> impl IntoElement {
         .border_1()
         .border_color(rgb(BORDER))
         .text_xs()
-        .child(div().pl_1p5().pr_0p5().text_color(rgb(MUTED)).child("Colour"))
-        .child(option("color-folder", "Folder", ColorBy::Folder, cx))
-        .child(option("color-kind", "Kind", ColorBy::Kind, cx))
+        .child(div().pl_1p5().pr_0p5().text_color(rgb(MUTED)).child(label))
+}
+
+/// "Colour: Folder | Kind" in the toolbar.
+fn color_toggle(current: ColorBy, cx: &mut Context<Petal>) -> impl IntoElement {
+    let option = |id, label, value: ColorBy, cx: &mut Context<Petal>| {
+        toggle_option(id, label, current == value).on_click(cx.listener(move |this, _, _, cx| this.set_color_by(value, cx)))
+    };
+    toggle("Colour").child(option("color-folder", "Folder", ColorBy::Folder, cx)).child(option("color-kind", "Kind", ColorBy::Kind, cx))
+}
+
+/// "Chart: Sunburst | Icicle | Treemap" in the toolbar.
+fn chart_toggle(current: ChartType, cx: &mut Context<Petal>) -> impl IntoElement {
+    let option = |id, label, hint, value: ChartType, cx: &mut Context<Petal>| {
+        toggle_option(id, label, current == value).tooltip(tooltip(hint)).on_click(cx.listener(move |this, _, _, cx| this.set_chart(value, cx)))
+    };
+    toggle("Chart")
+        .child(option("chart-sunburst", "Sunburst", "Rings round the folder (⌘1)", ChartType::Sunburst, cx))
+        .child(option("chart-icicle", "Icicle", "One column per level, names in full (⌘2)", ChartType::Icicle, cx))
+        .child(option("chart-treemap", "Treemap", "Boxes sized by space, every level at once (⌘3)", ChartType::Treemap, cx))
 }
 
 /// Which colour means which kind, for the kinds in view. Hover a kind to highlight it.
-fn render_legend(r: &Results, cx: &mut Context<Petal>) -> impl IntoElement {
-    let mut legend = div()
-        .absolute()
-        .left_4()
-        .bottom_4()
-        .flex()
-        .flex_col()
-        .gap_0p5()
-        .p_2()
-        .rounded_lg()
-        .bg(rgb(PANEL))
-        .border_1()
-        .border_color(rgb(BORDER))
-        .text_xs();
+/// `in_row`: a row under the chart, rather than a list in its corner.
+fn render_legend(r: &Results, in_row: bool, cx: &mut Context<Petal>) -> gpui::Div {
+    let legend = if in_row {
+        div().flex_none().flex().flex_wrap().justify_center().gap_x_3().gap_y_1().px_4().pb_3().text_xs()
+    } else {
+        div().absolute().left_4().bottom_4().flex().flex_col().gap_0p5().p_2().rounded_lg().bg(rgb(PANEL)).border_1().border_color(rgb(BORDER)).text_xs()
+    };
+    let mut legend = legend;
     for category in CATEGORIES.into_iter().filter(|&c| r.segments.iter().any(|s| r.category(s.target) == Some(c))) {
         let lit = r.legend_hover.is_none_or(|h| h == category);
         legend = legend.child(

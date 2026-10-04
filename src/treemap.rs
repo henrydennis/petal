@@ -20,16 +20,14 @@
 //!   (`fold`); the scan's tiles are in first-seen order and the results' largest first, so
 //!   morphing between them would only be a shuffle.
 
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::time::Instant;
 
-use gpui::{App, Bounds, ContentMask, Font, FontWeight, Hsla, Pixels, Point, SharedString, TextAlign, TextRun, Window, fill, hsla, point, px, size};
+use gpui::{App, Bounds, ContentMask, Font, FontWeight, Hsla, Pixels, Point, SharedString, TextAlign, Window, fill, hsla, point, px, size};
 use palette::IntoColor;
 
 use crate::motion::{Key, Spring, smootherstep};
-use crate::sunburst::{Hit, Segment};
+use crate::sunburst::{Hit, Segment, fit_line, label_color};
 
 /// Room above the chart for the app's hover label strip.
 const TOP_MARGIN: f32 = 52.0;
@@ -469,6 +467,8 @@ pub struct PaintedTile {
     pub leaf: bool,
     /// The tile area, which its label is kept inside as well as its own rect.
     pub clip: Bounds<Pixels>,
+    /// The colour it was painted, before its alpha, so its label can be made to read on it.
+    pub color: Hsla,
 }
 
 /// Motion for the treemap; see the module docs. The app calls `retarget` and `step` each
@@ -810,7 +810,7 @@ impl TreemapMotion {
                 if paint_tile(window, placed.rect, placed.color, placed.alpha)
                     && let Some(index) = placed.index
                 {
-                    painted.push(PaintedTile { index, rect: placed.rect.bounds(), alpha: placed.alpha, header: placed.header, leaf: placed.leaf, clip });
+                    painted.push(PaintedTile { index, rect: placed.rect.bounds(), alpha: placed.alpha, header: placed.header, leaf: placed.leaf, clip, color: placed.color });
                 }
             }
             painted
@@ -834,48 +834,6 @@ fn faded(color: Hsla, alpha: f32) -> Hsla {
     color
 }
 
-/// Text colour that reads on a tile of colour `bar`: near-white on dark tiles, near-black
-/// on light ones.
-fn ink(bar: Hsla, alpha: f32) -> Hsla {
-    if bar.lightness > 0.62 { hsla(0.0, 0.0, 0.08, 0.85 * alpha) } else { hsla(0.0, 0.0, 1.0, 0.92 * alpha) }
-}
-
-/// `text` shaped to fit `max_width`, cut short with "…" if need be (binary searching how
-/// many characters fit); `None` if not even one character does.
-fn fit(window: &Window, text: &SharedString, font: &Font, font_size: f32, color: Hsla, max_width: f32) -> Option<gpui::ShapedLine> {
-    let shape = |text: SharedString| {
-        let run = TextRun { len: text.len(), font: font.clone(), color, background_color: None, underline: None, strikethrough: None, letter_spacing: None };
-        window.text_system().shape_line(text, px(font_size), &[run], None)
-    };
-    if max_width <= 0.0 || text.is_empty() {
-        return None;
-    }
-    let text = one_line(text);
-    let full = shape(text.clone());
-    if f32::from(full.width()) <= max_width {
-        return Some(full);
-    }
-    let cuts: Vec<usize> = text.char_indices().map(|(at, _)| at).collect();
-    let cut = |n: usize| SharedString::from(format!("{}…", text[..cuts[n]].trim_end()));
-    // `lo` characters fit (0: none known to); all of them don't.
-    let (mut lo, mut hi) = (0, cuts.len());
-    while hi - lo > 1 {
-        let mid = (lo + hi) / 2;
-        if f32::from(shape(cut(mid)).width()) <= max_width {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    (lo > 0).then(|| shape(cut(lo)))
-}
-
-/// `text` with any line breaks made spaces: a file name can hold them, and a shaped line
-/// mustn't (gpui asserts it doesn't).
-fn one_line(text: &SharedString) -> SharedString {
-    if text.contains(['\n', '\r']) { text.replace(['\n', '\r'], " ").into() } else { text.clone() }
-}
-
 /// Paint a shaped line at `origin`, clipped to `clip`.
 fn paint_line(line: &gpui::ShapedLine, origin: Point<Pixels>, line_height: f32, clip: Rect, window: &mut Window, cx: &mut App) {
     window.with_content_mask(Some(ContentMask { bounds: clip.bounds() }), |window| {
@@ -889,11 +847,11 @@ fn paint_line(line: &gpui::ShapedLine, origin: Point<Pixels>, line_height: f32, 
 fn paint_name_and_size(name: &SharedString, size: &SharedString, font: &Font, ink: Hsla, origin: Point<Pixels>, max_width: f32, line_height: f32, clip: Rect, window: &mut Window, cx: &mut App) {
     const SPACE: f32 = 6.0;
     let quiet = faded(ink, 0.72);
-    let size_line = (!size.is_empty()).then(|| fit(window, size, font, 12.0, quiet, f32::INFINITY)).flatten();
+    let size_line = (!size.is_empty()).then(|| fit_line(window, size, font, 12.0, quiet, f32::INFINITY)).flatten();
     let size_width = size_line.as_ref().map(|l| f32::from(l.width()) + SPACE).unwrap_or(0.0);
-    let (name_line, with_size) = match fit(window, name, font, 12.0, ink, max_width - size_width) {
+    let (name_line, with_size) = match fit_line(window, name, font, 12.0, ink, max_width - size_width) {
         Some(line) if size_line.is_some() && (f32::from(line.width()) >= 24.0 || line.text == *name) => (Some(line), true),
-        _ => (fit(window, name, font, 12.0, ink, max_width), false),
+        _ => (fit_line(window, name, font, 12.0, ink, max_width), false),
     };
     let Some(name_line) = name_line else { return };
     paint_line(&name_line, origin, line_height, clip, window, cx);
@@ -905,9 +863,9 @@ fn paint_name_and_size(name: &SharedString, size: &SharedString, font: &Font, in
 
 /// Label the tiles `paint` drew: a folder's header strip gets "Name  size" on one line, and
 /// a tile with nothing drawn inside it gets its name, with its size below when there's room.
-/// `label` gives a tile's name, size and colour by its index in the latest layout. Labels
+/// `label` gives a tile's name and size by its index in the latest layout. Labels
 /// are cut short with "…" to fit, and clipped to their tiles.
-pub fn paint_labels(painted: &[PaintedTile], label: impl Fn(usize) -> Option<(SharedString, SharedString, Hsla)>, window: &mut Window, cx: &mut App) {
+pub fn paint_labels(painted: &[PaintedTile], label: impl Fn(usize) -> Option<(SharedString, SharedString)>, window: &mut Window, cx: &mut App) {
     const PAD: f32 = 6.0;
     let regular = window.text_style().font();
     let medium = Font { weight: FontWeight::MEDIUM, ..regular.clone() };
@@ -922,23 +880,23 @@ pub fn paint_labels(painted: &[PaintedTile], label: impl Fn(usize) -> Option<(Sh
             if rect.w() < 40.0 || rect.h() < HEADER {
                 continue;
             }
-            let Some((name, size, bar)) = label(tile.index) else { continue };
+            let Some((name, size)) = label(tile.index) else { continue };
             let strip = Rect { y1: rect.y0 + HEADER, ..rect }.clamped(area);
             let origin = point(px(rect.x0 + PAD), px(rect.y0));
-            paint_name_and_size(&name, &size, &medium, ink(bar, tile.alpha), origin, rect.w() - 2.0 * PAD, HEADER, strip, window, cx);
+            paint_name_and_size(&name, &size, &medium, label_color(tile.color, tile.alpha), origin, rect.w() - 2.0 * PAD, HEADER, strip, window, cx);
         } else if tile.leaf {
             if rect.w() < 40.0 || rect.h() < 16.0 {
                 continue;
             }
-            let Some((name, size, bar)) = label(tile.index) else { continue };
-            let ink = ink(bar, tile.alpha);
+            let Some((name, size)) = label(tile.index) else { continue };
+            let ink = label_color(tile.color, tile.alpha);
             let max_width = rect.w() - 2.0 * PAD;
             let clip = rect.clamped(area);
-            if let Some(line) = fit(window, &name, &medium, 12.0, ink, max_width) {
+            if let Some(line) = fit_line(window, &name, &medium, 12.0, ink, max_width) {
                 paint_line(&line, point(px(rect.x0 + PAD), px(rect.y0 + 1.0)), 16.0, clip, window, cx);
             }
             if rect.h() >= 32.0
-                && let Some(line) = fit(window, &size, &regular, 11.0, faded(ink, 0.8), max_width)
+                && let Some(line) = fit_line(window, &size, &regular, 11.0, faded(ink, 0.8), max_width)
             {
                 paint_line(&line, point(px(rect.x0 + PAD), px(rect.y0 + 16.0)), 14.0, clip, window, cx);
             }
@@ -957,7 +915,7 @@ pub fn paint_focus_bar(bar: Bounds<Pixels>, title: &SharedString, subtitle: &Sha
     window.paint_quad(fill(bar, background).corner_radii(px(4.0)));
     let medium = Font { weight: FontWeight::MEDIUM, ..window.text_style().font() };
     let origin = point(px(rect.x0 + 8.0), px(rect.y0));
-    paint_name_and_size(title, subtitle, &medium, ink(background, 1.0), origin, rect.w() - 16.0, rect.h(), rect, window, cx);
+    paint_name_and_size(title, subtitle, &medium, label_color(background, 1.0), origin, rect.w() - 16.0, rect.h(), rect, window, cx);
 }
 
 #[cfg(test)]
@@ -1371,11 +1329,6 @@ mod tests {
         assert!((covered - 0.75).abs() < 0.0075, "covers {covered}");
     }
 
-    #[test]
-    fn labels_are_one_line() {
-        assert_eq!(one_line(&"a\nb\r\nc".into()), SharedString::from("a b  c"));
-        assert_eq!(one_line(&"plain".into()), SharedString::from("plain"));
-    }
 
     #[test]
     fn a_pending_zoom_waits_for_the_next_layout() {

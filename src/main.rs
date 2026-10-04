@@ -23,7 +23,7 @@ use gpui::{
     point, prelude::*, px, size,
 };
 
-use app::{GoUp, OpenFolder, Petal, Rescan, StartOver};
+use app::{GoUp, OpenFolder, Petal, Rescan, ShowIcicle, ShowSunburst, ShowTreemap, StartOver};
 
 actions!(petal, [Quit, Hide, HideOthers, ShowAll, Minimize, Zoom, CloseWindow]);
 
@@ -73,6 +73,9 @@ fn main() {
             KeyBinding::new("backspace", GoUp, None),
             KeyBinding::new("escape", GoUp, None),
             KeyBinding::new("cmd-shift-d", StartOver, None),
+            KeyBinding::new("cmd-1", ShowSunburst, None),
+            KeyBinding::new("cmd-2", ShowIcicle, None),
+            KeyBinding::new("cmd-3", ShowTreemap, None),
         ]);
         cx.set_menus(vec![
             Menu {
@@ -95,6 +98,15 @@ fn main() {
                     MenuItem::action("Show Disks", StartOver),
                     MenuItem::separator(),
                     MenuItem::action("Close Window", CloseWindow),
+                ],
+                disabled: false,
+            },
+            Menu {
+                name: "View".into(),
+                items: vec![
+                    MenuItem::action("as Sunburst", ShowSunburst),
+                    MenuItem::action("as Icicle", ShowIcicle),
+                    MenuItem::action("as Treemap", ShowTreemap),
                 ],
                 disabled: false,
             },
