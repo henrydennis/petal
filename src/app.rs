@@ -1034,6 +1034,10 @@ impl Petal {
         r.refreshing = false;
         let touched: Vec<usize> = fresh.iter().map(|(ix, _)| *ix).collect();
         let focus_path = path_to(&r.tree, r.focus);
+        let hovered = match r.chart_hover {
+            Some(Hit::Segment(i)) => r.segments.get(i).map(|s| s.target),
+            _ => None,
+        };
         if scan::apply_changes(&mut r.tree, fresh) == 0 {
             return;
         }
@@ -1043,7 +1047,6 @@ impl Petal {
         }
         // A folder that's gone (or renamed) leaves the view at its nearest surviving parent.
         r.focus = resolve_path(&r.tree, &focus_path);
-        r.chart_hover = None;
         r.list_hover = r.list_hover.filter(|&ix| r.tree.is_attached(ix));
 
         let inside = |tree: &Tree, folder: usize| touched.iter().any(|&t| tree.is_ancestor_or_self(folder, t));
@@ -1071,6 +1074,12 @@ impl Petal {
             r.findings = fresh;
         }
         r.relayout();
+        // Segments are numbered afresh, so keep the hover on the same thing (the chart works out
+        // what's under the pointer again when it paints). Dropping it would flash the chart
+        // unhovered on every refresh.
+        if let Some(Hit::Segment(_)) = r.chart_hover {
+            r.chart_hover = hovered.and_then(|t| r.segments.iter().position(|s| s.target == t)).map(Hit::Segment);
+        }
         if findings_changed {
             self.resolve_pending_findings(cx);
         }
@@ -2467,6 +2476,7 @@ impl Petal {
             .unwrap_or(140.);
 
         let segments = r.segments.clone();
+        let chart_hover = r.chart_hover;
         let (keys, labels, layout_id) = (r.keys.clone(), r.labels.clone(), r.layout_id);
         let (motion, tiles, chart_type) = (r.motion.clone(), r.tiles.clone(), r.chart);
         // Colouring by folder takes the hue from the angle, so it follows the motion.
@@ -2549,6 +2559,17 @@ impl Petal {
                         }
 
                         let hits = Rc::new(frame.hits);
+                        // The chart can change under a still pointer: a refresh from disk lays it
+                        // out again, and segments move as it animates. Work out what's under the
+                        // pointer now rather than waiting for it to move.
+                        let pointer_at = window.mouse_position();
+                        let hit = if bounds.contains(&pointer_at) { hits.hit(pointer_at, &segments) } else { None };
+                        if hit != chart_hover {
+                            let entity = entity.clone();
+                            window.defer(cx, move |_, cx| {
+                                entity.update(cx, |this, cx| this.set_chart_hover(hit, cx)).ok();
+                            });
+                        }
                         let (hits_for_move, segments_for_move) = (hits.clone(), segments.clone());
                         let entity_for_move = entity.clone();
                         window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
