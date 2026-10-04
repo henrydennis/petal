@@ -286,6 +286,17 @@ fn segment_labels(tree: &Tree, focus: usize, segments: &[Segment], size: impl Fn
         .collect()
 }
 
+/// The child of `ancestor` on the way down to `node`, if `node` is inside it.
+fn child_toward(tree: &Tree, ancestor: usize, mut node: usize) -> Option<usize> {
+    while let Some(parent) = tree.nodes[node].parent {
+        if parent == ancestor {
+            return Some(node);
+        }
+        node = parent;
+    }
+    None
+}
+
 /// Folder names from the root down to `ix` (excluding the root itself).
 fn path_to(tree: &Tree, mut ix: usize) -> Vec<SharedString> {
     let mut names = Vec::new();
@@ -464,8 +475,18 @@ impl Results {
         }
         match self.chart {
             ChartType::Treemap => {
-                let (from, to) = (path_to(&self.tree, self.focus), path_to(&self.tree, ix));
-                self.tiles.borrow_mut().zoom(motion::Key::Node(from), motion::Key::Node(to));
+                // The camera moves between boxes on screen. Going down, the box leading to `ix`
+                // opens out (however deep `ix` is inside it); going up, the chart shrinks back
+                // into the box that leads to where it was.
+                let (tree, focus) = (&self.tree, self.focus);
+                let (from, to) = if tree.is_ancestor_or_self(focus, ix) {
+                    (focus, child_toward(tree, focus, ix).unwrap_or(ix))
+                } else if tree.is_ancestor_or_self(ix, focus) {
+                    (child_toward(tree, ix, focus).unwrap_or(focus), ix)
+                } else {
+                    (focus, ix)
+                };
+                self.tiles.borrow_mut().zoom(motion::Key::Node(path_to(tree, from)), motion::Key::Node(path_to(tree, to)));
             }
             ChartType::Sunburst | ChartType::Icicle => self.motion.borrow_mut().zoom(motion::Camera::between(&self.tree, self.focus, ix)),
         }
@@ -474,6 +495,29 @@ impl Results {
         self.list_hover = None;
         self.relayout();
         self.list_scroll.scroll_to_item(0, ScrollStrategy::Top);
+    }
+
+    /// Open the folder `ix` (clicked in the chart or the list). The treemap goes on through
+    /// folders that one folder fills (`treemap::opened`), so opening one always shows what's
+    /// inside rather than the same box, bigger.
+    fn open(&mut self, ix: usize) {
+        let to = if self.chart == ChartType::Treemap && self.tree.nodes[ix].kind == Kind::Dir { treemap::opened(&self.tree, ix) } else { ix };
+        self.navigate(to);
+    }
+
+    /// Where going up a level goes (the chart's centre, ⌘↑). The treemap skips folders that one
+    /// folder fills, which would show just a box leading back down (`treemap::enclosing`).
+    fn up_to(&self) -> Option<usize> {
+        match self.chart {
+            ChartType::Treemap => treemap::enclosing(&self.tree, self.focus),
+            ChartType::Sunburst | ChartType::Icicle => self.tree.nodes[self.focus].parent,
+        }
+    }
+
+    fn up(&mut self) {
+        if let Some(up) = self.up_to() {
+            self.navigate(up);
+        }
     }
 
     fn hovered(&self) -> Option<Target> {
@@ -904,10 +948,8 @@ impl Petal {
 
     fn go_up(&mut self, _: &GoUp, _: &mut Window, cx: &mut Context<Self>) {
         if let Screen::Results(r) = &mut self.screen {
-            if let Some(parent) = r.tree.nodes[r.focus].parent {
-                r.navigate(parent);
-                cx.notify();
-            }
+            r.up();
+            cx.notify();
         }
     }
 
@@ -1158,14 +1200,10 @@ impl Petal {
     fn chart_click(&mut self, hit: Hit, cx: &mut Context<Self>) {
         let Some(r) = self.results() else { return };
         match hit {
-            Hit::Center => {
-                if let Some(parent) = r.tree.nodes[r.focus].parent {
-                    r.navigate(parent);
-                }
-            }
+            Hit::Center => r.up(),
             Hit::Segment(i) => {
                 if let Some(Target::Node(ix)) = r.segments.get(i).map(|s| s.target) {
-                    r.navigate(ix);
+                    r.open(ix);
                 }
             }
         }
@@ -2118,7 +2156,7 @@ impl Petal {
                     }))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(r) = this.results() {
-                            r.navigate(ix);
+                            r.open(ix);
                             cx.notify();
                         }
                     }))
@@ -2414,7 +2452,7 @@ impl Petal {
                 };
                 ("Smaller objects".into(), size.unwrap_or_default())
             }
-            None if center_hovered => ("↑ Back".into(), format!("to “{}”", tree.nodes[tree.nodes[r.focus].parent.unwrap()].name)),
+            None if center_hovered => ("↑ Back".into(), r.up_to().map(|up| format!("to “{}”", tree.nodes[up].name)).unwrap_or_default()),
             // The treemap's focus bar names it already, just below.
             None if r.chart == ChartType::Treemap => (SharedString::default(), String::new()),
             None => {

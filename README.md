@@ -136,7 +136,8 @@ on the **Disks** screen, with your volumes, **Scan Home Folder** and **Choose Fo
 
 - **Hover** a slice or a row to see its size; the two stay in sync.
 - **Click** a folder (in the chart or the list) to zoom in. Click the centre (the bar along the top of
-  the icicle or treemap), or use the breadcrumbs, to go back up.
+  the icicle or treemap), or use the breadcrumbs, to go back up. In the treemap, a folder that holds
+  little but one other folder (an app's `Contents`, say) opens straight through to what's inside.
 - **Chart** in the toolbar draws the same folders as a sunburst, icicle or treemap; **Colour** colours
   them by folder or by kind.
 - **Click a finding** to open its folder in the chart; press **+** on it to collect it.

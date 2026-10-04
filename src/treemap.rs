@@ -28,6 +28,7 @@ use std::time::Instant;
 use gpui::{App, Bounds, ContentMask, Font, FontWeight, Hsla, Pixels, Point, SharedString, TextAlign, Window, fill, hsla, point, px, size};
 
 use crate::motion::{Key, Spring, smootherstep};
+use crate::scan::{Kind, Tree};
 use crate::sunburst::{Hit, Segment, fit_line, label_color};
 
 /// Room above the chart for the app's hover label strip.
@@ -160,6 +161,38 @@ fn squarify(weights: &[f64], whole: f64, rect: Rect) -> Vec<Rect> {
     }
     out.truncate(n);
     out
+}
+
+/// A folder filled this much by one folder inside it shows as just that one box, as if
+/// clicking it had only made the box bigger. Such chains are everywhere (an app's `Contents`,
+/// a crate's `src`, a build's `target/release`), so the treemap opens and leaves them as one.
+const FILLED: f64 = 0.99;
+
+/// The folder inside `ix` that fills it (`FILLED`), if one does.
+fn filled_by(tree: &Tree, ix: usize) -> Option<usize> {
+    let node = &tree.nodes[ix];
+    let &inner = node.children.iter().max_by_key(|&&c| tree.nodes[c].size)?;
+    let size = tree.nodes[inner].size as f64;
+    (tree.nodes[inner].kind == Kind::Dir && node.size > 0 && size >= node.size as f64 * FILLED).then_some(inner)
+}
+
+/// Where opening the folder `ix` goes: into it, and on through any folder that one folder
+/// fills, to the first that shows more than one box.
+pub fn opened(tree: &Tree, mut ix: usize) -> usize {
+    while let Some(inner) = filled_by(tree, ix) {
+        ix = inner;
+    }
+    ix
+}
+
+/// Where going up from `focus` goes: its folder, or, past any folder that one folder fills
+/// (which would show just a box leading back down), the first that shows more than one.
+pub fn enclosing(tree: &Tree, focus: usize) -> Option<usize> {
+    let mut up = tree.nodes[focus].parent?;
+    while let (Some(_), Some(parent)) = (filled_by(tree, up), tree.nodes[up].parent) {
+        up = parent;
+    }
+    Some(up)
 }
 
 /// The tile under `position` (tiles never overlap), or the focus bar as `Hit::Center`.
@@ -812,9 +845,62 @@ pub fn paint_focus_bar(bar: Bounds<Pixels>, title: &SharedString, subtitle: &Sha
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::Kind;
+    use crate::scan::Node;
     use crate::sunburst::Target;
+    use std::path::PathBuf;
     use std::time::Duration;
+
+    /// root ── crate (60) ── src (59.9) ── win (59.9) ── x (30), y (29.9)
+    ///     │                └ Cargo.toml (0.1)
+    ///     ├ docs (39) ── guide (38.4), notes (0.6)
+    ///     └ empty (1)
+    fn chains() -> Tree {
+        let mut nodes = Vec::new();
+        let mut add = |name: &str, size: u64, kind: Kind, parent: Option<usize>| {
+            nodes.push(Node { name: name.into(), size, kind, parent, children: Vec::new(), items: 1 });
+            let ix = nodes.len() - 1;
+            if let Some(p) = parent {
+                nodes[p].children.push(ix);
+            }
+            ix
+        };
+        let root = add("root", 1000, Kind::Dir, None);
+        let krate = add("crate", 600, Kind::Dir, Some(root));
+        let src = add("src", 599, Kind::Dir, Some(krate));
+        add("Cargo.toml", 1, Kind::File, Some(krate));
+        let win = add("win", 599, Kind::Dir, Some(src));
+        add("x", 300, Kind::Dir, Some(win));
+        add("y", 299, Kind::Dir, Some(win));
+        let docs = add("docs", 390, Kind::Dir, Some(root));
+        add("guide", 384, Kind::Dir, Some(docs));
+        add("notes", 6, Kind::File, Some(docs));
+        add("empty", 10, Kind::Dir, Some(root));
+        Tree { root_path: PathBuf::from("/"), nodes, errors: 0, cloud_only: 0 }
+    }
+
+    /// Opening a folder one folder fills goes on into it, as far as the chain goes; a folder
+    /// with a real second box (here 1.5%), or nothing inside, opens as it is.
+    #[test]
+    fn opening_goes_through_folders_one_folder_fills() {
+        let tree = chains();
+        let name = |ix: usize| tree.nodes[ix].name.to_string();
+        assert_eq!(name(opened(&tree, 1)), "win", "crate → src → win");
+        assert_eq!(name(opened(&tree, 7)), "docs", "guide is only 98.5% of docs");
+        assert_eq!(name(opened(&tree, 10)), "empty");
+        assert_eq!(name(opened(&tree, 4)), "win", "already there");
+    }
+
+    /// Going up skips the same chains on the way back, to the first folder showing more than
+    /// one box; it stops at the top whatever the top holds.
+    #[test]
+    fn going_up_skips_folders_one_folder_fills() {
+        let tree = chains();
+        let name = |ix: Option<usize>| ix.map(|ix| tree.nodes[ix].name.to_string());
+        assert_eq!(name(enclosing(&tree, 4)), Some("root".into()), "win → past src and crate → root");
+        assert_eq!(name(enclosing(&tree, 5)), Some("win".into()), "x → win, which holds two boxes");
+        assert_eq!(name(enclosing(&tree, 8)), Some("docs".into()));
+        assert_eq!(name(enclosing(&tree, 0)), None, "nothing above the top");
+    }
 
     fn seg(start: f32, end: f32, depth: usize) -> Segment {
         Segment { target: Target::Node(0), depth, start, end, kind: Kind::Dir }
