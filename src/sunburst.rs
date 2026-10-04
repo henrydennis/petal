@@ -1,8 +1,9 @@
 //! Sunburst and icicle layout, painting and hit testing.
 //!
 //! Angles are measured in turns (0..1), clockwise from 12 o'clock. The icicle is the same
-//! chart unrolled: rings become columns running left to right, and turns run top to bottom,
-//! so everything that thinks in rings and turns (the layout, the motion) works for both.
+//! chart unrolled and hung from the top: rings become rows falling from top to bottom, and
+//! turns run left to right, so everything that thinks in rings and turns (the layout, the
+//! motion) works for both.
 
 use std::f32::consts::TAU;
 
@@ -162,8 +163,8 @@ pub fn fade(color: Hsla) -> Hsla {
 /// Room left around the icicle: the app draws its hover label in the strip along the top.
 const ICICLE_MARGIN: f32 = 16.0;
 const ICICLE_TOP: f32 = 52.0;
-/// The icicle's first column (the folder in focus) is this share of a normal column: it
-/// only needs to be something to click to go up a level.
+/// The icicle's first row (the folder in focus, a bar across the top) is this share of a
+/// normal row: it only needs to be something to click to go up a level.
 const ICICLE_CENTER_SHARE: f32 = 0.5;
 /// Bars smaller than this lose their rounded corners, which would eat them.
 const ROUNDED_MIN_PX: f32 = 6.0;
@@ -173,18 +174,19 @@ const ROUNDED_MIN_PX: f32 = 6.0;
 pub enum Shape {
     /// Rings round `center`; "radius" is the distance from it.
     Sunburst { center: Point<Pixels> },
-    /// Columns from `left`, between `top` and `bottom` (window pixels); "radius" is x.
-    Icicle { top: f32, bottom: f32, left: f32 },
+    /// Rows falling from `top`, between `left` and `right` (window pixels); "radius" is y,
+    /// and turns run from `left` to `right`.
+    Icicle { top: f32, left: f32, right: f32 },
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct Geometry {
     pub shape: Shape,
-    /// Where the centre ends: the radius of the disc, or the right edge of the icicle's
-    /// first column.
+    /// Where the centre ends: the radius of the disc, or the bottom edge of the icicle's
+    /// first row.
     pub inner_radius: f32,
-    /// Inner and outer radius of each ring (for the icicle, the left and right edge of each
-    /// column).
+    /// Inner and outer radius of each ring (for the icicle, the top and bottom edge of each
+    /// row).
     pub rings: [(f32, f32); MAX_DEPTH],
 }
 
@@ -244,23 +246,24 @@ impl Geometry {
         Self { shape: Shape::Sunburst { center: bounds.center() }, inner_radius, rings }
     }
 
-    /// The icicle filling `bounds`, less a margin and the strip along the top. Columns are
-    /// all the same width (unlike the sunburst's rings, they don't need to thin out to
-    /// keep areas fair), apart from the focus folder's, which is half a column.
+    /// The icicle filling `bounds`, less a margin and the strip along the top: the focus
+    /// folder a bar across the top, and each level below it a row. Rows are all the same
+    /// height (unlike the sunburst's rings, they don't need to thin out to keep areas fair),
+    /// apart from the focus folder's, which is half a row.
     pub fn icicle(bounds: Bounds<Pixels>) -> Self {
         let left = f32::from(bounds.origin.x) + ICICLE_MARGIN;
         let right = (f32::from(bounds.origin.x + bounds.size.width) - ICICLE_MARGIN).max(left + 1.0);
         let top = f32::from(bounds.origin.y) + ICICLE_TOP;
         let bottom = (f32::from(bounds.origin.y + bounds.size.height) - ICICLE_MARGIN).max(top + 1.0);
-        let unit = (right - left) / (ICICLE_CENTER_SHARE + MAX_DEPTH as f32);
-        let inner_radius = left + unit * ICICLE_CENTER_SHARE;
+        let unit = (bottom - top) / (ICICLE_CENTER_SHARE + MAX_DEPTH as f32);
+        let inner_radius = top + unit * ICICLE_CENTER_SHARE;
         let mut rings = [(0.0, 0.0); MAX_DEPTH];
         for (k, ring) in rings.iter_mut().enumerate() {
             *ring = (inner_radius + unit * k as f32, inner_radius + unit * (k + 1) as f32);
         }
         // Exactly the edge, rather than whatever the sums round to.
-        rings[MAX_DEPTH - 1].1 = right;
-        Self { shape: Shape::Icicle { top, bottom, left }, inner_radius, rings }
+        rings[MAX_DEPTH - 1].1 = bottom;
+        Self { shape: Shape::Icicle { top, left, right }, inner_radius, rings }
     }
 
     /// A single ring, for small gauges.
@@ -272,11 +275,11 @@ impl Geometry {
         self.rings[MAX_DEPTH - 1].1
     }
 
-    /// The smallest radius there is: the middle of the disc, or the icicle's left edge.
+    /// The smallest radius there is: the middle of the disc, or the icicle's top edge.
     fn origin(&self) -> f32 {
         match self.shape {
             Shape::Sunburst { .. } => 0.0,
-            Shape::Icicle { left, .. } => left,
+            Shape::Icicle { top, .. } => top,
         }
     }
 
@@ -284,7 +287,7 @@ impl Geometry {
     fn icicle_rect(&self) -> Option<Bounds<Pixels>> {
         match self.shape {
             Shape::Sunburst { .. } => None,
-            Shape::Icicle { top, bottom, left } => Some(rect(left, top, self.outer_radius(), bottom)),
+            Shape::Icicle { top, left, right } => Some(rect(left, top, right, self.outer_radius())),
         }
     }
 
@@ -299,15 +302,15 @@ impl Geometry {
                 }
                 (distance, dx.atan2(-dy).rem_euclid(TAU) / TAU)
             }
-            Shape::Icicle { top, bottom, left } => {
+            Shape::Icicle { top, left, right } => {
                 let (x, y) = (f32::from(position.x), f32::from(position.y));
-                if x < left || x >= self.outer_radius() || y < top || y >= bottom {
+                if x < left || x >= right || y < top || y >= self.outer_radius() {
                     return None;
                 }
-                if x < self.inner_radius {
+                if y < self.inner_radius {
                     return Some(Hit::Center);
                 }
-                (x, (y - top) / (bottom - top))
+                (y, (x - left) / (right - left))
             }
         };
         let depth = self.rings.iter().position(|(r0, r1)| distance >= *r0 && distance < *r1)? + 1;
@@ -340,9 +343,9 @@ impl Geometry {
     }
 
     /// Inner and outer radius, and opacity, at any fractional ring depth. Below the first
-    /// ring a band sinks behind the centre (for the icicle, slides left into the first
-    /// column), fading; beyond the last it moves out past the edge, fading. That's where
-    /// the camera takes segments when zooming.
+    /// ring a band sinks behind the centre (for the icicle, slides up into the first row),
+    /// fading; beyond the last it moves out past the edge (for the icicle, down off the
+    /// bottom), fading. That's where the camera takes segments when zooming.
     pub fn band_at(&self, depth: f32) -> (f32, f32, f32) {
         let last = MAX_DEPTH as f32;
         if depth < 1.0 {
@@ -363,10 +366,10 @@ impl Geometry {
     /// Where a band is drawn in the icicle, inside its hairline gap; `None` if nothing's
     /// left of it (or this is a sunburst).
     fn icicle_bar(&self, r0: f32, r1: f32, start: f32, end: f32) -> Option<(f32, f32, f32, f32)> {
-        let Shape::Icicle { top, bottom, .. } = self.shape else { return None };
-        let height = bottom - top;
-        let (x0, x1) = (r0 + GAP_PX / 2.0, r1 - GAP_PX / 2.0);
-        let (y0, y1) = (top + start * height + GAP_PX / 2.0, top + end * height - GAP_PX / 2.0);
+        let Shape::Icicle { left, right, .. } = self.shape else { return None };
+        let width = right - left;
+        let (x0, x1) = (left + start * width + GAP_PX / 2.0, left + end * width - GAP_PX / 2.0);
+        let (y0, y1) = (r0 + GAP_PX / 2.0, r1 - GAP_PX / 2.0);
         (x1 > x0 && y1 > y0).then_some((x0, y0, x1, y1))
     }
 
@@ -445,12 +448,12 @@ impl Geometry {
         }
     }
 
-    /// The focus folder: the disc in the middle, or the icicle's first column. Paint it
-    /// after the segments, so those sinking into the centre go behind it.
+    /// The focus folder: the disc in the middle, or the bar across the top of the icicle.
+    /// Paint it after the segments, so those sinking into the centre go behind it.
     pub fn paint_center(&self, window: &mut Window, color: Hsla) {
         match self.shape {
             Shape::Sunburst { .. } => self.paint_disc(window, self.inner_radius - 1.0, color),
-            Shape::Icicle { left, .. } => self.paint_band(window, left, self.inner_radius, 0.0, 1.0, color),
+            Shape::Icicle { top, .. } => self.paint_band(window, top, self.inner_radius, 0.0, 1.0, color),
         }
     }
 }
@@ -472,7 +475,9 @@ const NAME_LINE: f32 = 15.0;
 const DETAIL_SIZE: f32 = 11.0;
 const DETAIL_LINE: f32 = 13.0;
 /// Labels need this much bar, after the gaps, to be worth drawing: room for a few letters,
-/// and for the whole name line, descenders and all, under the padding.
+/// and for the whole name line, descenders and all, under the padding. The text runs along
+/// the bar, so its share of the folder (its width) is what usually rules a label out; rows
+/// are tall enough for both lines unless the window is tiny.
 const LABEL_MIN_WIDTH: f32 = 28.0;
 const LABEL_MIN_HEIGHT: f32 = LABEL_PAD_TOP + NAME_LINE;
 /// Tall enough for the size under the name.
@@ -539,8 +544,9 @@ pub fn fit_line(window: &Window, text: &SharedString, font: &Font, font_size: f3
 /// Names (and sizes, where there's room) on the icicle's bars, as `ChartMotion::paint` drew
 /// them. `label` gives a segment's name and size; the text's colour is worked out from the
 /// colour the bar was painted. Each label is placed on and fitted to its whole bar, and
-/// clipped to the part that's showing, so it's uncovered along with the bar (by the reveal,
-/// or sliding out from under its parent) rather than cut short again every frame.
+/// clipped to the part that's showing, so it's uncovered along with the bar (by the reveal
+/// coming down the chart, or sliding down out from under its parent) rather than cut short
+/// again every frame.
 pub fn paint_icicle_labels(geometry: &Geometry, painted: &[Painted], label: impl Fn(usize) -> Option<(SharedString, SharedString)>, window: &mut Window, cx: &mut App) {
     let Some(area) = geometry.icicle_rect() else { return };
     let font = window.text_style().font();
@@ -554,7 +560,7 @@ pub fn paint_icicle_labels(geometry: &Geometry, painted: &[Painted], label: impl
         let text = label_color(bar.band.color, bar.band.alpha);
         let width = spot.x1 - spot.x0 - LABEL_PAD_X * 2.0;
         let origin = point(px(spot.x0 + LABEL_PAD_X), px(spot.y0 + LABEL_PAD_TOP));
-        let clip = ContentMask { bounds: rect(spot.shown.0, spot.y0, spot.shown.1, spot.y1).intersect(&area) };
+        let clip = ContentMask { bounds: rect(spot.x0, spot.shown.0, spot.x1, spot.shown.1).intersect(&area) };
         window.with_content_mask(Some(clip), |window| {
             if let Some(line) = fit_line(window, &name, &name_font, NAME_SIZE, text, width) {
                 line.paint(origin, px(NAME_LINE), TextAlign::Left, None, window, cx).ok();
@@ -571,19 +577,19 @@ pub fn paint_icicle_labels(geometry: &Geometry, painted: &[Painted], label: impl
 /// Where a bar's label goes (see `label_spot`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Spot {
-    /// The whole bar, inside its gap and right of the first column: the label sits on it
-    /// and is fitted to it.
+    /// The whole bar, inside its gap and below the first row: the label sits on it and is
+    /// fitted to it.
     x0: f32,
     y0: f32,
     x1: f32,
     y1: f32,
-    /// Left and right of the part that's showing, which the label is clipped to.
+    /// Top and bottom of the part that's showing, which the label is clipped to.
     shown: (f32, f32),
 }
 
 /// Where `painted[i]`'s label goes, if its bar is big enough for one and some of it is
-/// showing: not past what the reveal has uncovered, nor under bars painted after it that
-/// overlap it from the left or right (a folder's contents sliding out from under it).
+/// showing: not below what the reveal has uncovered, nor under bars painted after it that
+/// overlap it from above or below (a folder's contents sliding down out from under it).
 fn label_spot(geometry: &Geometry, painted: &[Painted], i: usize) -> Option<Spot> {
     let bar = &painted[i].band;
     let (x0, y0, x1, y1) = geometry.icicle_bar(bar.r0.max(geometry.inner_radius), bar.r1, bar.start, bar.end)?;
@@ -591,21 +597,21 @@ fn label_spot(geometry: &Geometry, painted: &[Painted], i: usize) -> Option<Spot
     if x1 - x0 < LABEL_MIN_WIDTH || y1 - y0 < LABEL_MIN_HEIGHT {
         return None;
     }
-    let (mut left, mut right) = (x0, x1.min(bar.reach - GAP_PX / 2.0));
-    // Neighbouring columns meet at an edge; only a real overlap counts.
+    let (mut top, mut bottom) = (y0, y1.min(bar.reach - GAP_PX / 2.0));
+    // Neighbouring rows meet at an edge; only a real overlap counts.
     const SLACK: f32 = 0.5;
     for over in &painted[i + 1..] {
         let over = &over.band;
-        if over.end <= bar.start + 1e-5 || over.start >= bar.end - 1e-5 || over.reach <= left + SLACK || over.r0 >= right - SLACK {
+        if over.end <= bar.start + 1e-5 || over.start >= bar.end - 1e-5 || over.reach <= top + SLACK || over.r0 >= bottom - SLACK {
             continue;
         }
-        if over.r0 <= left {
-            left = over.reach + GAP_PX / 2.0;
+        if over.r0 <= top {
+            top = over.reach + GAP_PX / 2.0;
         } else {
-            right = over.r0 - GAP_PX / 2.0;
+            bottom = over.r0 - GAP_PX / 2.0;
         }
     }
-    (right > left).then_some(Spot { x0, y0, x1, y1, shown: (left, right) })
+    (bottom > top).then_some(Spot { x0, y0, x1, y1, shown: (top, bottom) })
 }
 
 #[cfg(test)]
@@ -651,17 +657,18 @@ mod tests {
     }
 
     #[test]
-    fn icicle_columns_are_contiguous_and_fill_the_width() {
+    fn icicle_rows_are_contiguous_and_fill_the_height() {
         let g = Geometry::icicle(bounds());
-        let Shape::Icicle { top, bottom, left } = g.shape else { panic!("an icicle") };
-        assert_eq!((left, top, bottom), (116.0, 102.0, 634.0));
-        assert!((g.outer_radius() - 884.0).abs() < 1e-3);
+        let Shape::Icicle { top, left, right } = g.shape else { panic!("an icicle") };
+        assert_eq!((top, left, right), (102.0, 116.0, 884.0), "below the label strip, inside the margins");
+        assert!((g.outer_radius() - 634.0).abs() < 1e-3, "down to the bottom margin");
+        assert_eq!(g.icicle_rect(), Some(rect(116.0, 102.0, 884.0, 634.0)));
         assert!((g.rings[0].0 - g.inner_radius).abs() < 1e-3);
-        let width = g.rings[0].1 - g.rings[0].0;
-        assert!(((g.inner_radius - left) * 2.0 - width).abs() < 1e-3, "the centre is half a column");
+        let height = g.rings[0].1 - g.rings[0].0;
+        assert!(((g.inner_radius - top) * 2.0 - height).abs() < 1e-3, "the centre is half a row");
         for pair in g.rings.windows(2) {
             assert!(pair[0].0 < pair[0].1 && (pair[0].1 - pair[1].0).abs() < 1e-3, "{:?}", g.rings);
-            assert!((pair[1].1 - pair[1].0 - width).abs() < 1e-3, "columns are all the same width");
+            assert!((pair[1].1 - pair[1].0 - height).abs() < 1e-3, "rows are all the same height");
         }
     }
 
@@ -669,17 +676,39 @@ mod tests {
     fn icicle_hit_test_finds_bars_the_centre_and_nothing_outside() {
         let g = Geometry::icicle(bounds());
         let segments = [seg(1, 0.0, 0.5), seg(1, 0.5, 1.0), seg(2, 0.0, 0.25), seg(2, 0.25, 0.5)];
-        let Shape::Icicle { top, bottom, left } = g.shape else { panic!("an icicle") };
-        let at = |x: f32, turns: f32| point(px(x), px(top + (bottom - top) * turns));
-        let column = |depth: usize| (g.rings[depth - 1].0 + g.rings[depth - 1].1) / 2.0;
-        assert_eq!(g.hit_test(at(column(2), 0.375), &segments), Some(Hit::Segment(3)));
-        assert_eq!(g.hit_test(at(column(1), 0.75), &segments), Some(Hit::Segment(1)));
-        assert_eq!(g.hit_test(at((left + g.inner_radius) / 2.0, 0.6), &segments), Some(Hit::Center));
-        assert_eq!(g.hit_test(at(column(3), 0.1), &segments), None, "nothing in that column");
-        assert_eq!(g.hit_test(point(px(column(1)), px(top - 10.0)), &segments), None, "above, in the label strip");
-        assert_eq!(g.hit_test(at(left - 4.0, 0.5), &segments), None);
-        assert_eq!(g.hit_test(at(g.outer_radius() + 4.0, 0.5), &segments), None);
-        assert_eq!(g.hit_test(point(px(column(1)), px(bottom + 1.0)), &segments), None);
+        let Shape::Icicle { top, left, right } = g.shape else { panic!("an icicle") };
+        let at = |turns: f32, y: f32| point(px(left + (right - left) * turns), px(y));
+        let row = |depth: usize| (g.rings[depth - 1].0 + g.rings[depth - 1].1) / 2.0;
+        assert_eq!(g.hit_test(at(0.375, row(2)), &segments), Some(Hit::Segment(3)));
+        assert_eq!(g.hit_test(at(0.75, row(1)), &segments), Some(Hit::Segment(1)), "turns run left to right");
+        assert_eq!(g.hit_test(at(0.6, (top + g.inner_radius) / 2.0), &segments), Some(Hit::Center), "the bar across the top");
+        assert_eq!(g.hit_test(at(0.1, row(3)), &segments), None, "nothing in that row");
+        assert_eq!(g.hit_test(at(0.5, top - 10.0), &segments), None, "above, in the label strip");
+        assert_eq!(g.hit_test(point(px(left - 4.0), px(row(1))), &segments), None);
+        assert_eq!(g.hit_test(point(px(right + 4.0), px(row(1))), &segments), None);
+        assert_eq!(g.hit_test(at(0.5, g.outer_radius() + 1.0), &segments), None);
+    }
+
+    /// What you point at is what's painted there: the middle and every corner of each bar as
+    /// drawn hit that bar, and each bar runs across its row, below the centre.
+    #[test]
+    fn icicle_hit_test_agrees_with_painting() {
+        let g = Geometry::icicle(bounds());
+        let segments = [seg(1, 0.0, 0.6), seg(1, 0.6, 1.0), seg(2, 0.0, 0.1), seg(2, 0.1, 0.6), seg(3, 0.1, 0.35)];
+        for (i, s) in segments.iter().enumerate() {
+            let (r0, r1) = g.rings[s.depth - 1];
+            let (x0, y0, x1, y1) = g.icicle_bar(r0, r1, s.start, s.end).unwrap();
+            assert!(y0 > g.inner_radius && (y1 - y0 - (r1 - r0 - GAP_PX)).abs() < 1e-3, "the whole row, below the centre: {s:?}");
+            let inside = 0.1;
+            for (x, y) in [((x0 + x1) / 2.0, (y0 + y1) / 2.0), (x0 + inside, y0 + inside), (x1 - inside, y0 + inside), (x0 + inside, y1 - inside), (x1 - inside, y1 - inside)] {
+                assert_eq!(g.hit_test(point(px(x), px(y)), &segments), Some(Hit::Segment(i)), "{s:?} at {x}, {y}");
+            }
+        }
+        // And the bar across the top is the centre all the way along.
+        let Shape::Icicle { top, left, right } = g.shape else { unreachable!() };
+        for x in [left, (left + right) / 2.0, right - 0.1] {
+            assert_eq!(g.hit_test(point(px(x), px(top)), &segments), Some(Hit::Center));
+        }
     }
 
     #[test]
@@ -708,11 +737,16 @@ mod tests {
             assert!(alpha == 0.0 && r0 <= r1 && r1 <= g.inner_radius + 1e-3, "{g:?}: {r0} {r1}");
             assert_eq!(g.band_at(MAX_DEPTH as f32 + 1.0).2, 0.0);
         }
-        // The icicle's bands slide into its first column rather than past its left edge.
+        // The icicle's bands slide up into its first row rather than past its top edge, and
+        // fall off the bottom past the last.
         let g = Geometry::icicle(bounds());
-        let Shape::Icicle { left, .. } = g.shape else { unreachable!() };
-        assert_eq!(g.band_at(0.0).0, left);
-        assert!(g.band_at(-3.0).1 >= left);
+        let Shape::Icicle { top, .. } = g.shape else { unreachable!() };
+        assert_eq!(g.band_at(0.0).0, top);
+        assert!(g.band_at(-3.0).1 >= top);
+        let (gone, _, _) = g.band_at(MAX_DEPTH as f32 + 1.0);
+        assert!((gone - g.outer_radius()).abs() < 1e-3, "just below the bottom: {gone}");
+        let (higher, lower) = (g.band_at(1.5), g.band_at(2.0));
+        assert!(higher.0 < lower.0 && higher.1 < lower.1, "deeper is lower down");
     }
 
     #[test]
@@ -731,43 +765,52 @@ mod tests {
         Painted { index, band: Band { r0, r1, reach: r1, start, end, color: hsla(0.5, 0.5, 0.5, 1.0), alpha: 1.0 } }
     }
 
-    /// A folder's contents sliding out from under it: the label sits on the whole bar, and
-    /// is only clipped to where it shows.
+    /// A folder's contents sliding down out from under it: the label sits on the whole bar,
+    /// and is only clipped to where it shows.
     #[test]
     fn labels_keep_to_the_part_of_a_bar_that_shows() {
         let g = Geometry::icicle(bounds());
+        let Shape::Icicle { left, right, .. } = g.shape else { unreachable!() };
         let (c1, c2) = (g.rings[0], g.rings[1]);
         let half = (c2.1 - c2.0) / 2.0;
         // The child is halfway out from under its parent, which is painted over it.
         let child = bar(1, c1.0 + half, c1.1 + half, 0.0, 0.5);
         let parent = bar(0, c1.0, c1.1, 0.0, 0.5);
         let spot = label_spot(&g, &[child, parent], 0).unwrap();
-        assert!((spot.x0 - (c1.0 + half + GAP_PX / 2.0)).abs() < 1e-3 && (spot.x1 - (c1.1 + half - GAP_PX / 2.0)).abs() < 1e-3, "{spot:?}");
-        assert!(spot.shown.0 > c1.1 && (spot.shown.1 - spot.x1).abs() < 1e-3, "{spot:?}");
-        // Neighbouring columns don't hide each other.
+        assert!((spot.y0 - (c1.0 + half + GAP_PX / 2.0)).abs() < 1e-3 && (spot.y1 - (c1.1 + half - GAP_PX / 2.0)).abs() < 1e-3, "{spot:?}");
+        assert!((spot.x0 - (left + GAP_PX / 2.0)).abs() < 1e-3 && (spot.x1 - ((left + right) / 2.0 - GAP_PX / 2.0)).abs() < 1e-3, "as wide as its share: {spot:?}");
+        assert!(spot.shown.0 > c1.1 && (spot.shown.1 - spot.y1).abs() < 1e-3, "{spot:?}");
+        // Neighbouring rows don't hide each other.
         let next = bar(2, c2.0, c2.1, 0.0, 0.25);
         assert!((label_spot(&g, &[parent, next], 0).unwrap().shown.1 - (c1.1 - GAP_PX / 2.0)).abs() < 1e-3);
-        // Nor does anything in the first column get a label.
+        // Nor does anything in the first row get a label.
         let sunk = bar(3, g.inner_radius - 30.0, g.inner_radius, 0.0, 1.0);
         assert_eq!(label_spot(&g, &[sunk], 0), None);
-        // Too thin to read, even though it's tall enough for the letters themselves.
-        let height = |turns: f32| turns * (634.0 - 102.0) - GAP_PX;
+        // Too narrow for a few letters, even though there's height to spare.
+        let turns = |width: f32| (width + GAP_PX) / (right - left);
         assert_eq!(label_spot(&g, &[bar(0, c1.0, c1.1, 0.0, 0.01)], 0), None);
-        let short = (LABEL_MIN_HEIGHT - 1.0 + GAP_PX) / (634.0 - 102.0);
-        assert!(height(short) > 15.0);
-        assert_eq!(label_spot(&g, &[bar(0, c1.0, c1.1, 0.0, short)], 0), None, "descenders would be cut off");
+        assert_eq!(label_spot(&g, &[bar(0, c1.0, c1.1, 0.5, 0.5 + turns(LABEL_MIN_WIDTH - 1.0))], 0), None);
+        assert!(label_spot(&g, &[bar(0, c1.0, c1.1, 0.5, 0.5 + turns(LABEL_MIN_WIDTH + 1.0))], 0).is_some());
+        // Too short (a bar on its way into the first row), however wide.
+        let short = c1.0 + LABEL_MIN_HEIGHT - 1.0 + GAP_PX;
+        assert!(short - c1.0 - GAP_PX > NAME_SIZE);
+        assert_eq!(label_spot(&g, &[bar(0, c1.0, short, 0.0, 1.0)], 0), None, "descenders would be cut off");
+        // A whole row has room for the size under the name.
+        assert!(c1.1 - c1.0 - GAP_PX >= LABEL_TWO_LINES);
     }
 
-    /// While the reveal uncovers a bar, its label is fitted to the whole bar (so the text
-    /// doesn't change as more of it shows) and clipped to what's uncovered.
+    /// While the reveal uncovers a bar from the top down, its label is fitted to the whole bar
+    /// (so the text doesn't change as more of it shows) and clipped to what's uncovered.
     #[test]
     fn labels_are_uncovered_with_their_bars() {
         let g = Geometry::icicle(bounds());
+        let Shape::Icicle { left, right, .. } = g.shape else { unreachable!() };
         let (r0, r1) = g.rings[0];
         let revealing = Painted { band: Band { reach: r0 + 10.0, ..bar(0, r0, r1, 0.0, 0.5).band }, ..bar(0, r0, r1, 0.0, 0.5) };
         let spot = label_spot(&g, &[revealing], 0).expect("a label, partly uncovered");
-        assert!((spot.x1 - spot.x0 - (r1 - r0 - GAP_PX)).abs() < 1e-3, "fitted to the whole bar: {spot:?}");
-        assert!((spot.shown.1 - (r0 + 10.0 - GAP_PX / 2.0)).abs() < 1e-3, "clipped to what's uncovered: {spot:?}");
+        assert!((spot.y1 - spot.y0 - (r1 - r0 - GAP_PX)).abs() < 1e-3, "fitted to the whole bar: {spot:?}");
+        assert!((spot.x1 - spot.x0 - ((right - left) / 2.0 - GAP_PX)).abs() < 1e-3, "{spot:?}");
+        assert!((spot.shown.0 - spot.y0).abs() < 1e-3 && (spot.shown.1 - (r0 + 10.0 - GAP_PX / 2.0)).abs() < 1e-3, "clipped to what's uncovered: {spot:?}");
         // Nothing uncovered yet: no label.
         let hidden = Painted { band: Band { reach: r0, ..revealing.band }, ..revealing };
         assert_eq!(label_spot(&g, &[hidden], 0), None);

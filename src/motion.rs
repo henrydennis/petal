@@ -21,8 +21,9 @@
 //!   (`fold`).
 //!
 //! This drives the sunburst and the icicle alike, through `Geometry`, in the rings and turns
-//! `sunburst` describes: on the icicle, "outward" is left to right and "clockwise" is top to
-//! bottom. The treemap has its own motion, `treemap::TreemapMotion`, on the same principles.
+//! `sunburst` describes: on the icicle, "outward" is top to bottom (down from the focus
+//! folder's bar) and "clockwise" is left to right. The treemap has its own motion,
+//! `treemap::TreemapMotion`, on the same principles.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
