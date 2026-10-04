@@ -51,7 +51,7 @@ const ROW_HEIGHT: f32 = 30.0;
 /// How the chart is coloured.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ColorBy {
-    /// Each slice its own hue around the circle, so neighbouring folders stand apart.
+    /// Each slice its own hue along the chart, so neighbouring folders stand apart.
     Folder,
     /// By what things are: apps, caches, photos… (see `classify`).
     Kind,
@@ -60,12 +60,13 @@ enum ColorBy {
 /// How the chart is drawn. All three show the same layout (`sunburst::layout`), so colours,
 /// hover and zoom mean the same thing in each.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ChartType {
+pub enum ChartType {
     /// Rings round the folder in focus.
     Sunburst,
-    /// The sunburst unrolled into columns, one per level, so names fit (see `Geometry::icicle`).
+    /// The sunburst unrolled into columns, one per level, with room for names along each bar
+    /// (see `Geometry::icicle`).
     Icicle,
-    /// Nested rectangles sized by area, every level at once (see `treemap`).
+    /// Nested boxes sized by area (see `treemap`): a big file deep inside a folder is a big box.
     Treemap,
 }
 
@@ -1097,6 +1098,7 @@ impl Petal {
             return;
         }
         self.chart = chart;
+        cx.set_menus(crate::menus(chart));
         // Start the chart afresh, so it's revealed the way a new chart is rather than
         // morphing from a different shape.
         let (motion, tiles) = match &mut self.screen {
@@ -1309,7 +1311,7 @@ impl Render for Petal {
             .text_color(rgb(TEXT))
             .font_family(".SystemUIFont")
             .text_sm()
-            .child(self.render_toolbar(cx))
+            .child(self.render_toolbar(window, cx))
             .child(div().flex_1().min_h_0().flex().child(content))
             .when_some(self.notice.clone().filter(|_| self.error.is_none()), |el, notice| {
                 el.child(
@@ -1398,7 +1400,9 @@ fn to_hsla(color: u32) -> Hsla {
 }
 
 impl Petal {
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_toolbar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // In a narrow window the toggles drop their captions, so the breadcrumbs keep room.
+        let captions = window.viewport_size().width >= px(1100.);
         let mut bar = div()
             .id("toolbar")
             .h(px(46.))
@@ -1450,11 +1454,11 @@ impl Petal {
                             .px_1p5()
                             .py_0p5()
                             .rounded_md()
-                            .flex_shrink(1.)
                             .min_w(px(24.))
                             .truncate()
-                            .when(is_last, |d| d.font_weight(FontWeight::SEMIBOLD))
-                            .when(!is_last, |d| d.text_color(rgb(MUTED)).flex_shrink_0())
+                            // Short of room, the folders above give way before the one you're in.
+                            .when(is_last, |d| d.font_weight(FontWeight::SEMIBOLD).flex_shrink(1.))
+                            .when(!is_last, |d| d.text_color(rgb(MUTED)).flex_shrink(8.))
                             .cursor_pointer()
                             .hover(|s| s.bg(rgb(CARD_HOVER)))
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -1469,10 +1473,10 @@ impl Petal {
                 }
                 bar = bar.child(crumbs).child(div().flex_1());
                 bar = bar
-                    .child(chart_toggle(self.chart, cx))
-                    .child(color_toggle(r.color_by, cx))
+                    .child(chart_toggle(self.chart, captions, cx))
+                    .child(color_toggle(r.color_by, captions, cx))
                     .child(
-                        div().text_xs().text_color(rgb(MUTED)).flex_none().child(if r.out_of_date {
+                        div().text_xs().text_color(rgb(MUTED)).min_w(px(0.)).flex_shrink(1.).truncate().child(if r.out_of_date {
                             "Out of date · rescan to refresh".to_string()
                         } else {
                             format!("Scanned in {:.1}s", r.elapsed.as_secs_f32())
@@ -1490,7 +1494,7 @@ impl Petal {
                     );
             }
             Screen::Scanning(_) => {
-                bar = bar.child(div().font_weight(FontWeight::SEMIBOLD).child("Petal")).child(div().flex_1()).child(chart_toggle(self.chart, cx));
+                bar = bar.child(div().font_weight(FontWeight::SEMIBOLD).child("Petal")).child(div().flex_1()).child(chart_toggle(self.chart, captions, cx));
             }
             Screen::Start(_) => {
                 bar = bar.child(div().font_weight(FontWeight::SEMIBOLD).child("Petal"));
@@ -1732,7 +1736,8 @@ impl Petal {
         let motion = scanning.motion.clone();
         let bounds_cell = scanning.chart_bounds.clone();
 
-        // Centre label: how far the scan has got.
+        // The chart's label (centred on the sunburst, a strip above the icicle and treemap): how
+        // far the scan has got.
         let (title, lines): (String, Vec<String>) = match &layout {
                 Some(layout) => (
                     layout.name.clone(),
@@ -1754,7 +1759,7 @@ impl Petal {
         let tiles = scanning.tiles.clone();
         let paint_view = view.clone();
         // The treemap's focus bar names what's being scanned.
-        let focus = view.as_ref().map(|v| (v.tree.nodes[Tree::ROOT].name.clone(), SharedString::from(size_label(v, Tree::ROOT)), false));
+        let focus = view.as_ref().map(|v| (v.tree.nodes[Tree::ROOT].name.clone(), SharedString::from(size_label(v, Tree::ROOT))));
 
         let chart = div()
             .flex_1()
@@ -1802,7 +1807,7 @@ impl Petal {
                 )
                 .size_full(),
             )
-            .child(chart_label(chart_type, label_width, title.into(), lines));
+            .child(chart_label(chart_type, label_width, title.into(), lines, None));
 
         div().size_full().flex().child(sidebar).child(chart)
     }
@@ -2353,7 +2358,8 @@ impl Petal {
         };
         let center_hovered = r.chart_hover == Some(Hit::Center) && can_go_up;
 
-        // Label in the middle of the chart describes whatever is under the pointer.
+        // The chart's label (centred on the sunburst, a strip above the icicle and treemap)
+        // describes whatever is under the pointer.
         let (title, subtitle): (SharedString, String) = match hovered {
             Some(Target::Node(ix)) => {
                 let node = &tree.nodes[ix];
@@ -2378,6 +2384,8 @@ impl Petal {
                 ("Smaller objects".into(), size.unwrap_or_default())
             }
             None if center_hovered => ("↑ Back".into(), format!("to “{}”", tree.nodes[tree.nodes[r.focus].parent.unwrap()].name)),
+            // The treemap's focus bar names it already, just below.
+            None if r.chart == ChartType::Treemap => (SharedString::default(), String::new()),
             None => {
                 let node = &tree.nodes[r.focus];
                 (node.name.clone(), format_size(node.size))
@@ -2397,7 +2405,45 @@ impl Petal {
         let bounds_cell = r.chart_bounds.clone();
         let entity = cx.entity().downgrade();
         let focus_node = &tree.nodes[r.focus];
-        let focus = Some((focus_node.name.clone(), SharedString::from(format_size(focus_node.size)), center_hovered));
+        let focus = Some((focus_node.name.clone(), SharedString::from(format_size(focus_node.size))));
+        // The "done" moment: what the scan found, in one line.
+        let banner = r.banner.is_some().then(|| {
+            let total = tree.nodes[Tree::ROOT].size;
+            let pending = r.findings.iter().any(|f| f.pending);
+            let safe: u64 = r.findings.iter().filter(|f| f.safety == Safety::Safe).map(|f| f.size).sum();
+            let savings = if pending {
+                " · working out savings…".to_string()
+            } else if safe > 0 {
+                format!(" · {} safe to delete", format_size(safe))
+            } else {
+                String::new()
+            };
+            div()
+                .id("done-banner")
+                .flex_none()
+                .px_4()
+                .py_2()
+                .rounded_full()
+                .bg(rgb(CARD))
+                .border_1()
+                .border_color(rgb(0x3fb950))
+                .shadow_lg()
+                .flex()
+                .items_center()
+                .gap_2()
+                .cursor_pointer()
+                .child(div().text_color(rgb(0x3fb950)).font_weight(FontWeight::BOLD).child("✓"))
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(format!("Scan complete in {:.1} s", r.elapsed.as_secs_f32())))
+                .child(div().text_color(rgb(MUTED)).child(format!("{} accounted for{savings}", format_size(total))))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(r) = this.results() {
+                        r.banner = None;
+                        cx.notify();
+                    }
+                }))
+        });
+        // The icicle and treemap have a label strip to put it in.
+        let (in_strip, centred) = if chart_type == ChartType::Sunburst { (None, banner) } else { (banner, None) };
         // The icicle and treemap leave their legend room below them; the sunburst's sits in a corner.
         let legend = (r.color_by == ColorBy::Kind).then(|| render_legend(r, chart_type != ChartType::Sunburst, cx));
 
@@ -2462,50 +2508,10 @@ impl Petal {
                 .min_h_0()
                 .w_full(),
             )
-            .child(chart_label(chart_type, label_width, title, subtitle.lines().map(str::to_string).collect()))
+            .child(chart_label(chart_type, label_width, title, subtitle.lines().map(str::to_string).collect(), in_strip))
             .children(legend)
-            .when(r.banner.is_some(), |d| {
-                // The "done" moment: what the scan found, in one line.
-                let total = tree.nodes[Tree::ROOT].size;
-                let pending = r.findings.iter().any(|f| f.pending);
-                let safe: u64 = r.findings.iter().filter(|f| f.safety == Safety::Safe).map(|f| f.size).sum();
-                let savings = if pending {
-                    " · working out savings…".to_string()
-                } else if safe > 0 {
-                    format!(" · {} safe to delete", format_size(safe))
-                } else {
-                    String::new()
-                };
-                // Over the sunburst it's centred above the circle; the icicle and treemap keep their
-                // label strip along the top, so it goes to the right of that.
-                let place = |d: gpui::Div| if chart_type == ChartType::Sunburst { d.top_4().left_0().right_0().justify_center() } else { d.top_2().right_4() };
-                d.child(
-                    place(div().absolute().flex()).child(
-                        div()
-                            .id("done-banner")
-                            .px_4()
-                            .py_2()
-                            .rounded_full()
-                            .bg(rgb(CARD))
-                            .border_1()
-                            .border_color(rgb(0x3fb950))
-                            .shadow_lg()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .cursor_pointer()
-                            .child(div().text_color(rgb(0x3fb950)).font_weight(FontWeight::BOLD).child("✓"))
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child(format!("Scan complete in {:.1} s", r.elapsed.as_secs_f32())))
-                            .child(div().text_color(rgb(MUTED)).child(format!("{} accounted for{savings}", format_size(total))))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(r) = this.results() {
-                                    r.banner = None;
-                                    cx.notify();
-                                }
-                            })),
-                    ),
-                )
-            })
+            // Over the sunburst, the banner is centred above the circle.
+            .children(centred.map(|banner| div().absolute().top_4().left_0().right_0().flex().justify_center().child(banner)))
     }
 }
 
@@ -2567,9 +2573,10 @@ fn paint_treemap_backdrop(area: Bounds<Pixels>, window: &mut Window) {
 
 /// Move the chart on a frame and paint it, as whichever type it is: what the scan's and the
 /// results' canvases share. `fraction` is the share of the chart scanned so far, with
-/// `pending` the colour of the rest; `center` colours the sunburst's centre and the icicle's
-/// first column (both mean "the folder in focus"), and `focus` titles the treemap's focus
-/// bar (name, size, hovered). `color` is as for `ChartMotion::paint`.
+/// `pending` the colour of the rest; `center` colours what stands for the folder in focus and
+/// takes you up a level (the sunburst's centre, the icicle's first column, the treemap's focus
+/// bar), and `focus` titles the treemap's focus bar (name, size). `color` is as for
+/// `ChartMotion::paint`.
 #[allow(clippy::too_many_arguments)]
 fn paint_chart(
     chart: ChartType,
@@ -2578,7 +2585,7 @@ fn paint_chart(
     fraction: f32,
     pending: Option<Hsla>,
     center: Hsla,
-    focus: Option<(SharedString, SharedString, bool)>,
+    focus: Option<(SharedString, SharedString)>,
     motions: ChartMotions,
     window: &mut Window,
     cx: &mut App,
@@ -2626,8 +2633,8 @@ fn paint_chart(
             if !folding {
                 treemap::paint_labels(&painted, label, window, cx);
             }
-            if let Some((title, size, hovered)) = focus {
-                treemap::paint_focus_bar(bar, &title, &size, hovered, window, cx);
+            if let Some((title, size)) = focus {
+                treemap::paint_focus_bar(bar, &title, &size, center, window, cx);
             }
             ChartFrame { hits, moving, folding }
         }
@@ -2635,8 +2642,9 @@ fn paint_chart(
 }
 
 /// The label over the chart: in the middle of a sunburst (at most `max_width` across), or in
-/// a strip across the top of the icicle and treemap, which leave room for it there.
-fn chart_label(chart: ChartType, max_width: f32, title: SharedString, lines: Vec<String>) -> gpui::Div {
+/// a strip across the top of the icicle and treemap, which leave room for it there. The strip
+/// can end with `trailing` (the scan-complete banner), which the label gives way to.
+fn chart_label(chart: ChartType, max_width: f32, title: SharedString, lines: Vec<String>, trailing: Option<Stateful<gpui::Div>>) -> gpui::Div {
     if chart != ChartType::Sunburst {
         return div()
             .absolute()
@@ -2648,8 +2656,9 @@ fn chart_label(chart: ChartType, max_width: f32, title: SharedString, lines: Vec
             .flex()
             .items_center()
             .gap_3()
-            .child(div().min_w_0().text_base().font_weight(FontWeight::SEMIBOLD).truncate().child(title))
-            .child(div().flex_none().text_xs().text_color(rgb(MUTED)).child(lines.join("  ·  ")));
+            .child(div().min_w_0().flex_shrink_0().max_w(relative(0.6)).text_base().font_weight(FontWeight::SEMIBOLD).truncate().child(title))
+            .child(div().min_w_0().flex_1().text_xs().text_color(rgb(MUTED)).truncate().child(lines.join(" · ")))
+            .children(trailing);
     }
     div().absolute().inset_0().flex().flex_col().items_center().justify_center().child(
         div()
@@ -2677,8 +2686,8 @@ fn toggle_option(id: &'static str, label: &'static str, selected: bool) -> State
         .child(label)
 }
 
-/// A labelled row of `toggle_option`s.
-fn toggle(label: &'static str) -> gpui::Div {
+/// A row of `toggle_option`s, with its caption when there's room.
+fn toggle(caption: Option<&'static str>) -> gpui::Div {
     div()
         .flex()
         .flex_none()
@@ -2689,26 +2698,26 @@ fn toggle(label: &'static str) -> gpui::Div {
         .border_1()
         .border_color(rgb(BORDER))
         .text_xs()
-        .child(div().pl_1p5().pr_0p5().text_color(rgb(MUTED)).child(label))
+        .children(caption.map(|caption| div().pl_1p5().pr_0p5().text_color(rgb(MUTED)).child(caption)))
 }
 
 /// "Colour: Folder | Kind" in the toolbar.
-fn color_toggle(current: ColorBy, cx: &mut Context<Petal>) -> impl IntoElement {
+fn color_toggle(current: ColorBy, caption: bool, cx: &mut Context<Petal>) -> impl IntoElement {
     let option = |id, label, value: ColorBy, cx: &mut Context<Petal>| {
         toggle_option(id, label, current == value).on_click(cx.listener(move |this, _, _, cx| this.set_color_by(value, cx)))
     };
-    toggle("Colour").child(option("color-folder", "Folder", ColorBy::Folder, cx)).child(option("color-kind", "Kind", ColorBy::Kind, cx))
+    toggle(caption.then_some("Colour")).child(option("color-folder", "Folder", ColorBy::Folder, cx)).child(option("color-kind", "Kind", ColorBy::Kind, cx))
 }
 
 /// "Chart: Sunburst | Icicle | Treemap" in the toolbar.
-fn chart_toggle(current: ChartType, cx: &mut Context<Petal>) -> impl IntoElement {
+fn chart_toggle(current: ChartType, caption: bool, cx: &mut Context<Petal>) -> impl IntoElement {
     let option = |id, label, hint, value: ChartType, cx: &mut Context<Petal>| {
         toggle_option(id, label, current == value).tooltip(tooltip(hint)).on_click(cx.listener(move |this, _, _, cx| this.set_chart(value, cx)))
     };
-    toggle("Chart")
+    toggle(caption.then_some("Chart"))
         .child(option("chart-sunburst", "Sunburst", "Rings round the folder (⌘1)", ChartType::Sunburst, cx))
-        .child(option("chart-icicle", "Icicle", "One column per level, names in full (⌘2)", ChartType::Icicle, cx))
-        .child(option("chart-treemap", "Treemap", "Boxes sized by space, every level at once (⌘3)", ChartType::Treemap, cx))
+        .child(option("chart-icicle", "Icicle", "Columns, one per level, with names (⌘2)", ChartType::Icicle, cx))
+        .child(option("chart-treemap", "Treemap", "Nested boxes sized by space (⌘3)", ChartType::Treemap, cx))
 }
 
 /// Which colour means which kind, for the kinds in view. Hover a kind to highlight it.

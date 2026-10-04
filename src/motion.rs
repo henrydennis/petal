@@ -19,6 +19,10 @@
 //!   almost everything. Rather than shuffle, the scan's chart folds away clockwise, smallest
 //!   first, while the results open clockwise behind it at their true sizes, largest first
 //!   (`fold`).
+//!
+//! This drives the sunburst and the icicle alike, through `Geometry`, in the rings and turns
+//! `sunburst` describes: on the icicle, "outward" is left to right and "clockwise" is top to
+//! bottom. The treemap has its own motion, `treemap::TreemapMotion`, on the same principles.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -255,7 +259,7 @@ pub struct ChartMotion {
     last_frame: Option<Instant>,
     /// Which layout the targets come from, to retarget only on change.
     layout_id: usize,
-    /// Share of the circle the chart covers (volume scans fill it as they go).
+    /// Share of the chart it covers, in turns (volume scans fill it as they go).
     fraction: Spring,
     /// Applied to the next layout: the focus changed.
     camera: Option<Camera>,

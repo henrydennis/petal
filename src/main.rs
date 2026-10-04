@@ -23,7 +23,7 @@ use gpui::{
     point, prelude::*, px, size,
 };
 
-use app::{GoUp, OpenFolder, Petal, Rescan, ShowIcicle, ShowSunburst, ShowTreemap, StartOver};
+use app::{ChartType, GoUp, OpenFolder, Petal, Rescan, ShowIcicle, ShowSunburst, ShowTreemap, StartOver};
 
 actions!(petal, [Quit, Hide, HideOthers, ShowAll, Minimize, Zoom, CloseWindow]);
 
@@ -77,50 +77,7 @@ fn main() {
             KeyBinding::new("cmd-2", ShowIcicle, None),
             KeyBinding::new("cmd-3", ShowTreemap, None),
         ]);
-        cx.set_menus(vec![
-            Menu {
-                name: "Petal".into(),
-                items: vec![
-                    MenuItem::action("Hide Petal", Hide),
-                    MenuItem::action("Hide Others", HideOthers),
-                    MenuItem::action("Show All", ShowAll),
-                    MenuItem::separator(),
-                    MenuItem::action("Quit Petal", Quit),
-                ],
-                disabled: false,
-            },
-            Menu {
-                name: "File".into(),
-                items: vec![
-                    MenuItem::action("Open Folder…", OpenFolder),
-                    MenuItem::action("Rescan", Rescan),
-                    MenuItem::separator(),
-                    MenuItem::action("Show Disks", StartOver),
-                    MenuItem::separator(),
-                    MenuItem::action("Close Window", CloseWindow),
-                ],
-                disabled: false,
-            },
-            Menu {
-                name: "View".into(),
-                items: vec![
-                    MenuItem::action("as Sunburst", ShowSunburst),
-                    MenuItem::action("as Icicle", ShowIcicle),
-                    MenuItem::action("as Treemap", ShowTreemap),
-                ],
-                disabled: false,
-            },
-            Menu {
-                name: "Go".into(),
-                items: vec![MenuItem::action("Enclosing Folder", GoUp)],
-                disabled: false,
-            },
-            Menu {
-                name: "Window".into(),
-                items: vec![MenuItem::action("Minimize", Minimize), MenuItem::action("Zoom", Zoom)],
-                disabled: false,
-            },
-        ]);
+        cx.set_menus(menus(ChartType::Sunburst));
 
         let bounds = Bounds::centered(None, size(px(1240.), px(800.)), cx);
         cx.open_window(
@@ -150,6 +107,55 @@ fn main() {
         .detach();
         cx.activate(true);
     });
+}
+
+/// The menu bar, with the chart type in use ticked in the View menu (the app sets them again
+/// when it changes).
+pub fn menus(chart: ChartType) -> Vec<Menu> {
+    vec![
+        Menu {
+            name: "Petal".into(),
+            items: vec![
+                MenuItem::action("Hide Petal", Hide),
+                MenuItem::action("Hide Others", HideOthers),
+                MenuItem::action("Show All", ShowAll),
+                MenuItem::separator(),
+                MenuItem::action("Quit Petal", Quit),
+            ],
+            disabled: false,
+        },
+        Menu {
+            name: "File".into(),
+            items: vec![
+                MenuItem::action("Open Folder…", OpenFolder),
+                MenuItem::action("Rescan", Rescan),
+                MenuItem::separator(),
+                MenuItem::action("Show Disks", StartOver),
+                MenuItem::separator(),
+                MenuItem::action("Close Window", CloseWindow),
+            ],
+            disabled: false,
+        },
+        Menu {
+            name: "View".into(),
+            items: vec![
+                MenuItem::action("as Sunburst", ShowSunburst).checked(chart == ChartType::Sunburst),
+                MenuItem::action("as Icicle", ShowIcicle).checked(chart == ChartType::Icicle),
+                MenuItem::action("as Treemap", ShowTreemap).checked(chart == ChartType::Treemap),
+            ],
+            disabled: false,
+        },
+        Menu {
+            name: "Go".into(),
+            items: vec![MenuItem::action("Enclosing Folder", GoUp)],
+            disabled: false,
+        },
+        Menu {
+            name: "Window".into(),
+            items: vec![MenuItem::action("Minimize", Minimize), MenuItem::action("Zoom", Zoom)],
+            disabled: false,
+        },
+    ]
 }
 
 /// Run `f` on the frontmost window, if Petal has one.

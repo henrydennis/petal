@@ -478,11 +478,16 @@ const LABEL_MIN_HEIGHT: f32 = LABEL_PAD_TOP + NAME_LINE;
 /// Tall enough for the size under the name.
 const LABEL_TWO_LINES: f32 = LABEL_MIN_HEIGHT + DETAIL_LINE;
 
-/// Text that reads on a bar of colour `bar`: near-white on most, near-black on light ones,
-/// faded with the bar.
+/// Text that reads on a bar of colour `bar`: near-black on bars that look light, near-white
+/// on the rest, faded with the bar. "Look light" goes by luminance, not HSL lightness: a
+/// yellow and a blue of the same lightness are far apart to the eye.
 pub fn label_color(bar: Hsla, alpha: f32) -> Hsla {
     let alpha = alpha * bar.alpha;
-    if bar.lightness > 0.62 { hsla(0.0, 0.0, 0.08, 0.85 * alpha) } else { hsla(0.0, 0.0, 1.0, 0.92 * alpha) }
+    let rgb: gpui::Rgba = palette::IntoColor::into_color(bar);
+    let linear = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+    let luminance = 0.2126 * linear(rgb.red) + 0.7152 * linear(rgb.green) + 0.0722 * linear(rgb.blue);
+    // About where black and white text contrast equally with the bar.
+    if luminance > 0.18 { hsla(0.0, 0.0, 0.08, 0.85 * alpha) } else { hsla(0.0, 0.0, 1.0, 0.92 * alpha) }
 }
 
 /// `text` as one line: file names can hold newlines and other control characters, which
@@ -493,8 +498,9 @@ fn single_line(text: &SharedString) -> SharedString {
 }
 
 /// `text` shaped to fit in `max_width`, cut short with "…" if it doesn't; `None` if not even
-/// a letter fits. Binary search on the number of characters kept, so a long name costs a
-/// handful of shapings rather than one per character.
+/// a letter fits. The cut is found on the whole line as shaped (usually cached from the last
+/// frame), so a long name costs one or two new shapings, not a search: labels are fitted
+/// every frame, and while the chart moves their widths change every frame.
 pub fn fit_line(window: &Window, text: &SharedString, font: &Font, font_size: f32, color: Hsla, max_width: f32) -> Option<ShapedLine> {
     if max_width <= 0.0 || text.is_empty() {
         return None;
@@ -508,21 +514,26 @@ pub fn fit_line(window: &Window, text: &SharedString, font: &Font, font_size: f3
     if f32::from(whole.width()) <= max_width {
         return Some(whole);
     }
-    // Byte offsets after each character, so any prefix is a valid string.
-    let ends: Vec<usize> = text.char_indices().map(|(i, c)| i + c.len_utf8()).collect();
-    let cut = |chars: usize| SharedString::from(format!("{}…", text[..ends[chars - 1]].trim_end()));
-    let (mut lo, mut hi, mut best) = (1, ends.len() - 1, None);
-    while lo <= hi {
-        let mid = (lo + hi) / 2;
-        let line = shape(cut(mid));
-        if f32::from(line.width()) <= max_width {
-            best = Some(line);
-            lo = mid + 1;
-        } else {
-            hi = mid - 1;
-        }
+    let ellipsis = f32::from(shape("…".into()).width());
+    // Everything before the character that straddles the room left for the "…".
+    let room = max_width - ellipsis;
+    let mut at = if room > 0.0 { whole.index_for_x(px(room)).unwrap_or(text.len()).min(text.len()) } else { 0 };
+    while !text.is_char_boundary(at) {
+        at -= 1;
     }
-    best
+    // Shaped on its own, the shorter text can kern a hair wider: then give up one more character.
+    for _ in 0..2 {
+        let kept = text[..at].trim_end();
+        if kept.is_empty() {
+            return None;
+        }
+        let line = shape(format!("{kept}…").into());
+        if f32::from(line.width()) <= max_width {
+            return Some(line);
+        }
+        at = kept.char_indices().last().map_or(0, |(i, _)| i);
+    }
+    None
 }
 
 /// Names (and sizes, where there's room) on the icicle's bars, as `ChartMotion::paint` drew
@@ -707,9 +718,13 @@ mod tests {
     #[test]
     fn labels_contrast_with_their_bars() {
         let light = label_color(hsla(0.3, 0.5, 0.8, 1.0), 1.0);
-        let dark = label_color(hsla(0.3, 0.5, 0.4, 1.0), 0.5);
+        let dark = label_color(hsla(0.3, 0.5, 0.3, 1.0), 0.5);
         assert!(light.lightness < 0.2 && (light.alpha - 0.85).abs() < 1e-4);
         assert!(dark.lightness > 0.9 && (dark.alpha - 0.46).abs() < 1e-4, "faded with the bar");
+        // A first-ring folder's yellow and blue (`base_color`): same lightness, but the yellow
+        // looks far lighter, and white on it would barely read.
+        assert!(label_color(hsla(0.17, 0.7, 0.52, 1.0), 1.0).lightness < 0.2, "dark text on yellow");
+        assert!(label_color(hsla(0.66, 0.7, 0.52, 1.0), 1.0).lightness > 0.9, "light text on blue");
     }
 
     fn bar(index: usize, r0: f32, r1: f32, start: f32, end: f32) -> Painted {

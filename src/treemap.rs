@@ -24,7 +24,6 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use gpui::{App, Bounds, ContentMask, Font, FontWeight, Hsla, Pixels, Point, SharedString, TextAlign, Window, fill, hsla, point, px, size};
-use palette::IntoColor;
 
 use crate::motion::{Key, Spring, smootherstep};
 use crate::sunburst::{Hit, Segment, fit_line, label_color};
@@ -752,20 +751,36 @@ impl TreemapMotion {
         moving
     }
 
-    /// Every tile where it is right now, in painting order: tiles on their way out first
-    /// (underneath), shallowest first, then the latest layout depth-first, so folders are
-    /// beneath their contents.
+    /// Every tile where it is right now, in painting order: the latest layout depth-first, so
+    /// folders are beneath their contents. A tile on its way out goes just above the folder
+    /// it was in (and beneath what's growing into its place), so it's seen shrinking away
+    /// rather than hidden by the folder at once; with no folder left on screen, it goes
+    /// underneath everything.
     fn placed(&self) -> Vec<Placed> {
         let Some(area) = self.area else { return Vec::new() };
         let fraction = self.fraction.x;
         // Volume scans fill the area from the left as they go.
         let squeeze = |r: Rect| Rect { x0: area.x0 + (r.x0 - area.x0) * fraction, x1: area.x0 + (r.x1 - area.x0) * fraction, ..r };
-        let mut gone: Vec<&TileMotion> = self.tiles.values().filter(|m| m.current.is_none()).collect();
-        gone.sort_by_key(|m| m.depth);
-        let mut out: Vec<Placed> = gone
-            .into_iter()
-            .map(|m| Placed { index: None, rect: squeeze(m.rect()), alpha: m.alpha.x.clamp(0.0, 1.0), color: m.color, header: false, leaf: false })
-            .collect();
+        // Departing tiles by the folder they were in, if that's still on screen.
+        let mut inside: HashMap<Option<&Key>, Vec<(&Key, &TileMotion)>> = HashMap::new();
+        for (key, motion) in self.tiles.iter().filter(|(_, m)| m.current.is_none()) {
+            let parent = motion.parent.as_ref().filter(|p| self.tiles.contains_key(*p));
+            inside.entry(parent).or_default().push((key, motion));
+        }
+        for tiles in inside.values_mut() {
+            tiles.sort_by_key(|(_, m)| m.depth);
+        }
+        /// The departing tiles in `parent`, each followed by its own departing contents.
+        fn departing<'a>(inside: &HashMap<Option<&'a Key>, Vec<(&'a Key, &'a TileMotion)>>, parent: Option<&'a Key>, out: &mut Vec<&'a TileMotion>) {
+            for &(key, motion) in inside.get(&parent).into_iter().flatten() {
+                out.push(motion);
+                departing(inside, Some(key), out);
+            }
+        }
+        let leaving = |motion: &TileMotion| Placed { index: None, rect: squeeze(motion.rect()), alpha: motion.alpha.x.clamp(0.0, 1.0), color: motion.color, header: false, leaf: false };
+        let mut gone = Vec::new();
+        departing(&inside, None, &mut gone);
+        let mut out: Vec<Placed> = gone.into_iter().map(leaving).collect();
         // While revealing, each folder carries its contents along as it grows.
         let mut carried = vec![Affine::IDENTITY; self.keys.len()];
         for (i, key) in self.keys.iter().enumerate() {
@@ -780,6 +795,9 @@ impl TreemapMotion {
             }
             let tile = &self.layout[i];
             out.push(Placed { index: Some(i), rect: squeeze(rect), alpha, color: motion.color, header: tile.header, leaf: tile.inner.is_none() });
+            let mut gone = Vec::new();
+            departing(&inside, Some(key), &mut gone);
+            out.extend(gone.into_iter().map(leaving));
         }
         out
     }
@@ -904,14 +922,14 @@ pub fn paint_labels(painted: &[PaintedTile], label: impl Fn(usize) -> Option<(Sh
     }
 }
 
-/// The focus folder's bar across the top of the chart (see `content_area`): its name and
-/// size, or, hovered, where clicking goes. Clicking it goes up a level (`Hit::Center`).
-pub fn paint_focus_bar(bar: Bounds<Pixels>, title: &SharedString, subtitle: &SharedString, hovered: bool, window: &mut Window, cx: &mut App) {
+/// The focus folder's bar across the top of the chart (see `content_area`), in `background`
+/// (the app lightens it while hovered), with the folder's name and size. Clicking it goes up a
+/// level (`Hit::Center`); the app's label strip says where to.
+pub fn paint_focus_bar(bar: Bounds<Pixels>, title: &SharedString, subtitle: &SharedString, background: Hsla, window: &mut Window, cx: &mut App) {
     let rect = Rect::of(bar);
     if !rect.visible() {
         return;
     }
-    let background: Hsla = gpui::rgb(if hovered { 0x3a3d44 } else { 0x2b2d33 }).into_color();
     window.paint_quad(fill(bar, background).corner_radii(px(4.0)));
     let medium = Font { weight: FontWeight::MEDIUM, ..window.text_style().font() };
     let origin = point(px(rect.x0 + 8.0), px(rect.y0));
@@ -1435,6 +1453,29 @@ mod tests {
         check(&motion);
         run(&mut motion, &mut t, check);
         assert!(at_targets(&motion));
+    }
+
+    /// A tile leaving a folder that stays is drawn above the folder (which would otherwise
+    /// cover it at once) and beneath the sibling growing into its place; one with no folder
+    /// left on screen goes underneath everything.
+    #[test]
+    fn a_tile_leaving_a_folder_that_stays_is_seen_shrinking() {
+        let mut motion = TreemapMotion::default();
+        let mut t = Instant::now();
+        let (keys, segments) = root();
+        motion.retarget(1, &keys, &segments, area(), 1.0);
+        run(&mut motion, &mut t, |_| {});
+        // "a/y" goes, and "b" with it; "a" and "a/x" stay.
+        motion.retarget(2, &[key("a"), key("a/x")], &[seg(0.0, 1.0, 1), seg(0.0, 0.5, 2)], area(), 1.0);
+        t += Duration::from_millis(16);
+        motion.step(t);
+        let placed = motion.placed();
+        let at = |rect: Rect| placed.iter().position(|p| p.index.is_none() && close(p.rect, rect)).expect("on its way out");
+        let (y, b) = (at(now(&motion, "a/y")), at(now(&motion, "b")));
+        let folder = placed.iter().position(|p| p.index == Some(0)).unwrap();
+        let sibling = placed.iter().position(|p| p.index == Some(1)).unwrap();
+        assert!(folder < y && y < sibling, "a/y between a and a/x: {folder} {y} {sibling}");
+        assert_eq!(b, 0, "b, with nothing left to sit in, underneath everything");
     }
 
     #[test]
