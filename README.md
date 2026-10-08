@@ -5,9 +5,9 @@
 <h1 align="center">Petal</h1>
 
 <p align="center">
-  <b>See what's filling your Mac. In seconds.</b><br>
-  A fast, exact disk-space explorer for macOS with a live sunburst chart.<br>
-  Free and open source, written in Rust with a GPU-rendered native UI.
+  <b>Petal tells you what's safe to delete on your Mac, why, and exactly what you'll get back.</b><br>
+  A fast disk-space explorer for macOS that understands APFS clones, hard links, snapshots and purgeable space.<br>
+  Free and open source, works offline, written in Rust with a GPU-rendered native UI.
 </p>
 
 <p align="center">
@@ -28,6 +28,23 @@ Petal shows your disk as a sunburst: the centre is the folder you're looking at,
 level deeper, and the size of a slice is how much space it takes. Prefer bars or boxes? The same
 picture also comes as an icicle or a treemap. It draws the picture *while* it reads, tells you which
 big folders are safe to clear, and tells you exactly how much deleting them will free.
+
+## How Petal differs from DaisyDisk
+
+Petal is inspired by [DaisyDisk](https://daisydiskapp.com), which pioneered the sunburst disk explorer
+on the Mac and is still actively maintained. Petal is an independent project, not affiliated with it.
+DaisyDisk is the better-known, more mature app. Petal tries to do a few things differently:
+
+- **It tells you what's safe to delete, and why.** Known space hogs are labelled **Safe to delete** or
+  **Review first**, each with a one-line explanation of what the folder is.
+- **It tells you exactly what deleting your selection frees.** On APFS, deleting a cloned or
+  hard-linked file may free nothing. Petal counts clones and hard links once when it works out what a
+  finding or your Collector selection frees, and this is checked by a test that deletes real files on
+  a throwaway APFS volume and compares the space actually freed. The chart's sizes count hard links
+  once too; like Finder, they show each clone at its full allocated size.
+- **It draws while it reads.** The chart appears in the first second and fills in as the scan goes,
+  as a sunburst, an icicle or a treemap.
+- **It's free, open source (MIT) and offline.** No account, no network access, no analytics.
 
 ## Highlights
 
@@ -271,8 +288,7 @@ across updates.
 
 ## Credits
 
-- Inspired by [DaisyDisk](https://daisydiskapp.com), which pioneered the sunburst disk explorer on
-  the Mac. Petal is an independent project, not affiliated with it.
+- Inspired by DaisyDisk (see [How Petal differs from DaisyDisk](#how-petal-differs-from-daisydisk)).
 - Built on [GPUI CE](https://github.com/gpui-ce/gpui-ce), [rayon](https://github.com/rayon-rs/rayon),
   [palette](https://github.com/Ogeon/palette) and [trash](https://github.com/Byron/trash-rs).
 - The promo video was edited in Tesseract with motion graphics made in
