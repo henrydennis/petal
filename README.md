@@ -44,10 +44,14 @@ big folders are safe to clear, and tells you exactly how much deleting them will
   other APFS volume (macOS itself, Preboot, VM, Recovery…) gets an exact slice, so the chart adds
   up to the disk's used space **to the byte**.
 - **Findings.** Petal checks the usual suspects first (Trash, Downloads, Xcode build files and
-  archives, iOS device support and simulators, iPhone backups, Docker, app caches, npm, Cargo, Gradle,
-  Movies, Mail, `node_modules`, Chrome's update leftovers, Git repositories bloated with unpacked
-  objects) and labels each **Safe to delete** or **Review first**, with a one-line explanation. For
-  Git repositories Petal copies the `git gc` commands for you rather than deleting anything. The first ones show up within a fraction of a second.
+  archives, iOS device support and simulators, iPhone backups, Docker's disk image, app caches,
+  Homebrew, npm, the pnpm store, Cargo, Gradle, Movies, Mail, `node_modules`, Cargo `target` folders,
+  local AI models from Ollama, LM Studio and Hugging Face, Claude Code and Codex histories, Chrome's
+  update leftovers, Git repositories bloated with unpacked objects) and labels each **Safe to
+  delete**, **Review first** or **Manage in app**, with a one-line explanation. "Manage in app"
+  items are never offered for the Trash. Where a tool has its own way to clean up (`git gc`, `brew
+  cleanup`, `pnpm store prune`, `docker system prune`), Petal copies the command for you rather than
+  deleting anything. The first ones show up within a fraction of a second.
 - **Savings you can trust.** On APFS, deleting a cloned or hard-linked file may free nothing. Petal
   works out what deleting your selection *really* frees, counting clones and hard links once, and
   this is tested against real deletions on a throwaway APFS volume.
