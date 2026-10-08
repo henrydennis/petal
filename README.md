@@ -187,6 +187,99 @@ on the **Disks** screen, with your volumes, **Scan Home Folder** and **Choose Fo
 
 You can also pass a folder on the command line: `petal ~/Library`.
 
+## Command line
+
+Two commands work without opening a window, for scripts and coding agents. Add `--json` for
+machine-readable output; without it they print a short summary.
+
+```bash
+petal scan ~/Library --json                  # sizes of a folder and what's in it
+petal scan ~/Library --json --depth 3 --top 10
+petal findings --json                        # findings in your home folder
+petal findings ~/code --json                 # findings in another folder
+```
+
+From the app bundle, run `/Applications/Petal.app/Contents/MacOS/petal`. (A folder called `scan`
+or `findings` in the current folder now needs `./`: `petal ./scan` opens it in the app.)
+
+- `--depth N` lists N levels of folders below the scanned folder (default 2).
+- `--top N` lists the N largest items in each folder (default 20). The rest are added up into one
+  `"other"` entry, so a folder's entries always add up to its size.
+- Invalid arguments print the usage on stderr and exit with status 2. A folder that's missing or
+  can't be read prints a plain message on stderr (never JSON) and exits with status 1.
+
+**Sizes.** Every size is a whole number of bytes, and is *allocated* size (blocks on disk, like
+Finder's "on disk"). A file with several hard links is counted once. An APFS clone is counted at its
+full allocation in scan sizes, as Finder counts it. `frees_bytes` is different: it's what deleting
+all of a finding would really free, so clone data shared with files outside it, and hard-linked
+files with links outside it, free nothing and aren't counted.
+
+**Text.** Output is UTF-8. A name that isn't valid UTF-8 has its invalid bytes replaced with U+FFFD
+(`�`), so such a path can't be used to open the file.
+
+**Stability.** `schema_version` is 1. Fields may be added in any release, so ignore fields you don't
+know. Fields are never removed or renamed, nor their meaning changed, without increasing
+`schema_version`.
+
+### `petal scan PATH --json`
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema_version` | integer | Version of this schema: 1 |
+| `petal_version` | string | Petal's version, such as `"0.5.0"` |
+| `command` | string | `"scan"` |
+| `root` | string | The folder scanned, as an absolute path. Scanning `/` reads the startup disk's Data volume, so this is where it's mounted (usually `/System/Volumes/Data`) |
+| `size_bytes` | integer | Total size. For the startup disk this includes the other APFS volumes and what couldn't be read, so it matches the disk's used space |
+| `files` | integer | Files counted (each name of a hard-linked file counts) |
+| `folders` | integer | Folders inside `root` |
+| `errors` | integer | Entries that couldn't be read |
+| `unreadable` | array | Folders that couldn't be read: `{"path": string, "whole": bool}`; `whole` is false when only some entries in it failed |
+| `cloud_only_folders` | integer | iCloud folders whose contents are only in the cloud, which Petal skips rather than downloads |
+| `purgeable_bytes` | integer or null | Space macOS can free by itself, when `root` is a whole volume |
+| `snapshots` | array | On the startup disk, its APFS snapshots: `{"name": string, "created": integer}` (seconds since 1970) |
+| `depth`, `top` | integer | The limits used |
+| `tree` | entry | The scanned folder, as an entry |
+
+Each entry has:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `name` | string | File or folder name |
+| `path` | string or null | Absolute path; null for `slice` and `other` |
+| `kind` | string | `"folder"`, `"file"`, `"slice"` (space with nothing to open, such as the macOS volume or "Not readable" on the startup disk) or `"other"` (smaller items added up) |
+| `size_bytes` | integer | Size, including everything inside |
+| `files` | integer | Files inside (1 for a file) |
+| `own_bytes` | integer | Folders whose contents are listed: the folder's own allocation, so `own_bytes` plus the children's `size_bytes` equals `size_bytes` |
+| `children` | array | Folders above the depth limit: their contents, largest first, at most `top` entries plus one `other` |
+| `count` | integer | `other` entries only: how many items were added up |
+
+### `petal findings [PATH] --json`
+
+`PATH` defaults to your home folder, as in the app. Working out `frees_bytes` reads the findings'
+folders again, so this takes a little longer than a scan.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema_version`, `petal_version` | | As for `scan` |
+| `command` | string | `"findings"` |
+| `root` | string | The folder scanned |
+| `min_size_bytes` | integer | Findings whose allocated size is below this are left out (50 MB) |
+| `findings` | array | Largest saving first |
+
+Each finding has:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `id` | string | Stable machine name, such as `"xcode_build_files"`, `"node_modules"` or `"unpacked_git_data"` |
+| `title` | string | What the app shows, such as `"Xcode build files"` |
+| `explanation` | string | The app's one-line explanation |
+| `safety` | string | `"safe"` (rebuilt or downloaded again when needed) or `"review"` (look first: it may hold things you want) |
+| `action` | string | `"trash"` (delete its folders) or `"git_gc"` (run the `commands`; never delete a `.git` folder) |
+| `paths` | array of strings | Every folder involved |
+| `allocated_bytes` | integer | Allocated size of its folders (for `git_gc`, of the repositories' loose objects) |
+| `frees_bytes` | integer or null | Exactly what deleting all of `paths` would free; null for `git_gc` |
+| `commands` | array of strings | Shell commands to run instead of deleting (`git gc` for each repository); empty otherwise |
+
 ## How it works
 
 ```
