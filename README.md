@@ -169,6 +169,8 @@ on the **Disks** screen, with your volumes, **Scan Home Folder** and **Choose Fo
   little but one other folder (an app's `Contents`, say) opens straight through to what's inside.
 - **Chart** in the toolbar draws the same folders as a sunburst, icicle or treemap; **Colour** colours
   them by folder or by kind.
+- **Colour: Safety** colours what the findings cover: green if safe to delete, amber if worth a
+  review first. Everything else is grey, which means no finding covers it, not that it's safe.
 - **Click a finding** to open its folder in the chart; press **+** on it to collect it.
 - In the list, **⌕** reveals an item in Finder and **+** adds it to the Collector.
 - **Move to Trash…** asks for confirmation, moves the collected items to the Trash, and updates every
@@ -273,6 +275,9 @@ across updates.
 
 - Inspired by [DaisyDisk](https://daisydiskapp.com), which pioneered the sunburst disk explorer on
   the Mac. Petal is an independent project, not affiliated with it.
+- The "smaller objects" segment, which shows a folder's too-small files together instead of
+  leaving them out, comes from Taras Brizitsky's
+  [Sunburst — An interactive guide](https://tbrizitsky.github.io/Sunburst-article/) (code CC0).
 - Built on [GPUI CE](https://github.com/gpui-ce/gpui-ce), [rayon](https://github.com/rayon-rs/rayon),
   [palette](https://github.com/Ogeon/palette) and [trash](https://github.com/Byron/trash-rs).
 - The promo video was edited in Tesseract with motion graphics made in

@@ -23,6 +23,7 @@ use crate::disk;
 use crate::eta;
 use crate::onboarding;
 use crate::findings::{self, Finding, Fix, Safety};
+use crate::safety;
 use crate::icons;
 use crate::live;
 use crate::motion;
@@ -45,8 +46,8 @@ const ACCENT: u32 = 0x4f9dff;
 const DANGER: u32 = 0xe5484d;
 /// ACCENT, faint: the background of something already in the Collector.
 const ACCENT_TINT: u32 = 0x4f9dff1f;
-const SAFE: u32 = 0x3fb950;
-const WARNING: u32 = 0xd29922;
+const SAFE: u32 = safety::SAFE;
+const WARNING: u32 = safety::REVIEW;
 
 const ROW_HEIGHT: f32 = 30.0;
 
@@ -57,6 +58,9 @@ enum ColorBy {
     Folder,
     /// By what things are: apps, caches, photos… (see `classify`).
     Kind,
+    /// By what the findings say about deleting things: safe, review first, or nothing
+    /// known (see `safety`).
+    Safety,
 }
 
 /// How the chart is drawn. All three show the same layout (`sunburst::layout`; the treemap
@@ -251,7 +255,7 @@ impl LiveView {
             .collect();
         // Honest sizes, as in the list: folders still being counted show a lower bound.
         let (tree, done) = (&self.tree, &self.done);
-        self.labels = segment_labels(tree, Tree::ROOT, &segments, |ix| {
+        self.labels = segment_labels(tree, &segments, |ix| {
             let node = &tree.nodes[ix];
             if node.kind == Kind::Dir && !done[ix] { format!("≥ {}", format_size(node.size)) } else { format_size(node.size) }
         });
@@ -277,15 +281,22 @@ fn resolve_path(tree: &Tree, path: &[SharedString]) -> usize {
 }
 
 /// Each segment's name and size, for labels on the chart. `size` gives a node's size as shown.
-fn segment_labels(tree: &Tree, focus: usize, segments: &[Segment], size: impl Fn(usize) -> String) -> Vec<(SharedString, SharedString)> {
-    let total = tree.nodes[focus].size as f64;
+fn segment_labels(tree: &Tree, segments: &[Segment], size: impl Fn(usize) -> String) -> Vec<(SharedString, SharedString)> {
     segments
         .iter()
         .map(|s| match s.target {
             Target::Node(ix) => (tree.nodes[ix].name.clone(), size(ix).into()),
-            Target::Small { .. } => ("Smaller objects".into(), format_size(((s.end - s.start) as f64 * total) as u64).into()),
+            Target::Small { size: bytes, .. } => ("Smaller objects".into(), format_size(bytes).into()),
         })
         .collect()
+}
+
+/// The node a segment stands for: its own, or for "smaller objects", their folder.
+fn owner(target: Target) -> usize {
+    match target {
+        Target::Node(ix) => ix,
+        Target::Small { parent, .. } => parent,
+    }
 }
 
 /// The child of `ancestor` on the way down to `node`, if `node` is inside it.
@@ -349,6 +360,11 @@ struct Results {
     categories: HashMap<usize, Category>,
     /// The kind under the pointer in the chart's legend: the chart highlights just that.
     legend_hover: Option<Category>,
+    /// What the findings say about each folder, for colouring by safety, and what that is
+    /// for each node in the chart (`owner`), worked out once a layout rather than every
+    /// frame. Both are made again with each layout, so they keep up with the findings.
+    safety_labels: safety::Labels,
+    safety_in_view: HashMap<usize, Option<safety::Label>>,
     /// Folders that look like someone's home folder (`home_folders`).
     homes: Vec<usize>,
     id: u64,
@@ -422,6 +438,8 @@ impl Results {
             color_by,
             categories: HashMap::new(),
             legend_hover: None,
+            safety_labels: safety::Labels::default(),
+            safety_in_view: HashMap::new(),
             homes: Vec::new(),
             id: NEXT_RESULTS_ID.fetch_add(1, Ordering::Relaxed),
             watch: None,
@@ -450,6 +468,14 @@ impl Results {
                 }
             }
         }
+        if self.color_by == ColorBy::Safety {
+            self.safety_labels = safety::Labels::new(&self.findings);
+            self.safety_in_view.clear();
+            for s in &segments {
+                let (tree, labels, ix) = (&self.tree, &self.safety_labels, owner(s.target));
+                self.safety_in_view.entry(ix).or_insert_with(|| labels.of(tree, ix));
+            }
+        }
         self.swatches = segments
             .iter()
             .filter_map(|s| match s.target {
@@ -467,7 +493,7 @@ impl Results {
                 .collect(),
         );
         let tree = &self.tree;
-        self.labels = Rc::new(segment_labels(tree, self.focus, &segments, |ix| format_size(tree.nodes[ix].size)));
+        self.labels = Rc::new(segment_labels(tree, &segments, |ix| format_size(tree.nodes[ix].size)));
         self.segments = Rc::new(segments);
         self.layout_id = NEXT_LAYOUT_ID.fetch_add(1, Ordering::Relaxed);
     }
@@ -485,13 +511,23 @@ impl Results {
         }
     }
 
+    /// What the findings say about a segment (laid out with colouring by safety).
+    fn safety_of(&self, target: Target) -> Option<safety::Label> {
+        self.safety_in_view.get(&owner(target)).copied().flatten()
+    }
+
     fn color(&self, segment: &Segment) -> Hsla {
+        // A touch lighter per ring, so nested folders of the same colour stay apart.
+        let ringed = |base: Hsla, alpha: f32| {
+            let lightness = (base.lightness + 0.015 * (segment.depth - 1) as f32).min(0.9);
+            gpui::hsla(base.hue.into_positive_degrees() / 360.0, base.saturation, lightness, alpha)
+        };
         match (self.color_by, self.category(segment.target)) {
-            (ColorBy::Kind, Some(category)) => {
-                let base = classify::color(category);
-                // A touch lighter per ring, so nested folders of the same kind stay apart.
-                let lightness = (base.lightness + 0.015 * (segment.depth - 1) as f32).min(0.9);
-                gpui::hsla(base.hue.into_positive_degrees() / 360.0, base.saturation, lightness, 1.0)
+            (ColorBy::Kind, Some(category)) => ringed(classify::color(category), 1.0),
+            (ColorBy::Safety, _) => {
+                // "Smaller objects" stay see-through, as in the other colourings.
+                let alpha = if matches!(segment.target, Target::Small { .. }) { sunburst::SMALL_ALPHA } else { 1.0 };
+                ringed(to_hsla(safety::color(self.safety_of(segment.target).map(|l| l.safety))), alpha)
             }
             _ => sunburst::base_color(segment),
         }
@@ -1438,9 +1474,14 @@ impl Petal {
         r.relayout();
         // Segments are numbered afresh, so keep the hover on the same thing (the chart works out
         // what's under the pointer again when it paints). Dropping it would flash the chart
-        // unhovered on every refresh.
+        // unhovered on every refresh. "Smaller objects" are the same run however many there
+        // are now.
+        let same = |a: Target, b: Target| match (a, b) {
+            (Target::Small { parent: p, first: f, .. }, Target::Small { parent: q, first: g, .. }) => (p, f) == (q, g),
+            _ => a == b,
+        };
         if let Some(Hit::Segment(_)) = r.chart_hover {
-            r.chart_hover = hovered.and_then(|t| r.segments.iter().position(|s| s.target == t)).map(Hit::Segment);
+            r.chart_hover = hovered.and_then(|t| r.segments.iter().position(|s| same(s.target, t))).map(Hit::Segment);
         }
         if findings_changed {
             self.resolve_pending_findings(cx);
@@ -2431,10 +2472,7 @@ impl Petal {
         let safe: u64 = findings.iter().filter(|f| f.safety == Safety::Safe).map(|f| f.size).sum();
         let mut list = div().id("findings").max_h(px(250.)).overflow_y_scroll().flex().flex_col().gap_0p5();
         for (i, finding) in findings.iter().enumerate() {
-            let (tag, color) = match finding.safety {
-                Safety::Safe => ("Safe to delete", SAFE),
-                Safety::Review => ("Review first", WARNING),
-            };
+            let (tag, color) = (safety::label(finding.safety), safety::color(Some(finding.safety)));
             let target = finding.nodes.first().copied().filter(|_| finding.path.is_some());
             let nodes = finding.nodes.clone();
             let uncollect = finding.nodes.clone();
@@ -2861,7 +2899,7 @@ impl Petal {
                 };
                 match (lit, r.color_by) {
                     (true, ColorBy::Folder) => sunburst::highlight(base),
-                    (true, ColorBy::Kind) => sunburst::lift(base),
+                    (true, ColorBy::Kind | ColorBy::Safety) => sunburst::lift(base),
                     (false, _) => sunburst::dim(base),
                 }
             })
@@ -2887,19 +2925,20 @@ impl Petal {
                     Kind::Other if node.name.as_ref() == disk::SNAPSHOTS_AND_UNREADABLE => "held by APFS snapshots, or not readable".into(),
                     Kind::Other => "exact, from APFS".into(),
                 };
-                let kind = match r.category(Target::Node(ix)) {
-                    Some(category) if r.color_by == ColorBy::Kind && node.kind != Kind::Other => format!("\n{}", category.label()),
+                let kind = match (r.color_by, r.category(Target::Node(ix))) {
+                    (ColorBy::Kind, Some(category)) if node.kind != Kind::Other => format!("\n{}", category.label()),
+                    (ColorBy::Safety, _) if node.kind != Kind::Other => match r.safety_labels.of(tree, ix) {
+                        Some(label) => format!("\n{} ({})", safety::label(label.safety), label.title),
+                        None => "\nNo finding: not known to be safe".into(),
+                    },
                     _ => String::new(),
                 };
                 (node.name.clone(), format!("{}\n{detail}{kind}", format_size(node.size)))
             }
-            // Only the chart has these, and its label already says how big the run is.
-            Some(Target::Small { .. }) => {
-                let size = match r.chart_hover {
-                    Some(Hit::Segment(i)) => r.labels.get(i).map(|(_, size)| size.to_string()),
-                    _ => None,
-                };
-                ("Smaller objects".into(), size.unwrap_or_default())
+            // Only the chart has these: things too small to show on their own, together.
+            Some(Target::Small { count, size, .. }) => {
+                let things = if count == 1 { "1 item".to_string() } else { format!("{} items", format_count(count as u64)) };
+                ("Smaller objects".into(), format!("{}\n{things} too small to show", format_size(size)))
             }
             None if center_hovered => ("↑ Back".into(), r.up_to().map(|up| format!("to “{}”", tree.nodes[up].name)).unwrap_or_default()),
             // The treemap's focus bar names it already, just below.
@@ -2964,7 +3003,12 @@ impl Petal {
         // The icicle and treemap have a label strip to put it in.
         let (in_strip, centred) = if chart_type == ChartType::Sunburst { (None, banner) } else { (banner, None) };
         // The icicle and treemap leave their legend room below them; the sunburst's sits in a corner.
-        let legend = (r.color_by == ColorBy::Kind).then(|| render_legend(r, chart_type != ChartType::Sunburst, cx));
+        let in_row = chart_type != ChartType::Sunburst;
+        let legend = match r.color_by {
+            ColorBy::Kind => Some(render_legend(r, in_row, cx)),
+            ColorBy::Safety => Some(render_safety_legend(in_row)),
+            ColorBy::Folder => None,
+        };
 
         div()
             .flex_1()
@@ -3233,12 +3277,15 @@ fn toggle(caption: Option<&'static str>) -> gpui::Div {
         .children(caption.map(|caption| div().pl_1p5().pr_0p5().text_color(rgb(MUTED)).child(caption)))
 }
 
-/// "Colour: Folder | Kind" in the toolbar.
+/// "Colour: Folder | Kind | Safety" in the toolbar.
 fn color_toggle(current: ColorBy, caption: bool, cx: &mut Context<Petal>) -> impl IntoElement {
     let option = |id, label, value: ColorBy, cx: &mut Context<Petal>| {
         toggle_option(id, current == value).child(label).on_click(cx.listener(move |this, _, _, cx| this.set_color_by(value, cx)))
     };
-    toggle(caption.then_some("Colour")).child(option("color-folder", "Folder", ColorBy::Folder, cx)).child(option("color-kind", "Kind", ColorBy::Kind, cx))
+    toggle(caption.then_some("Colour"))
+        .child(option("color-folder", "Folder", ColorBy::Folder, cx))
+        .child(option("color-kind", "Kind", ColorBy::Kind, cx))
+        .child(option("color-safety", "Safety", ColorBy::Safety, cx))
 }
 
 /// "Chart: Sunburst | Icicle | Treemap" in the toolbar, each with a picture of the chart. In a
@@ -3257,15 +3304,38 @@ fn chart_toggle(current: ChartType, caption: bool, cx: &mut Context<Petal>) -> i
         .child(option("chart-treemap", "Treemap", "Treemap: boxes sized by space, one level at a time (⌘3)", ChartType::Treemap, cx))
 }
 
-/// Which colour means which kind, for the kinds in view. Hover a kind to highlight it.
-/// `in_row`: a row under the chart, rather than a list in its corner.
-fn render_legend(r: &Results, in_row: bool, cx: &mut Context<Petal>) -> gpui::Div {
-    let legend = if in_row {
+/// The box a legend goes in. `in_row`: a row under the chart, rather than a list in its corner.
+fn legend_box(in_row: bool) -> gpui::Div {
+    if in_row {
         div().flex_none().flex().flex_wrap().justify_center().gap_x_3().gap_y_1().px_4().pb_3().text_xs()
     } else {
         div().absolute().left_4().bottom_4().flex().flex_col().gap_0p5().p_2().rounded_lg().bg(rgb(PANEL)).border_1().border_color(rgb(BORDER)).text_xs()
-    };
-    let mut legend = legend;
+    }
+}
+
+/// What the colours mean when colouring by safety. All of them, whatever's in view, so it's
+/// always clear that grey isn't a verdict.
+fn render_safety_legend(in_row: bool) -> gpui::Div {
+    let mut legend = legend_box(in_row);
+    for (verdict, text) in safety::LEGEND {
+        legend = legend.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_1()
+                .text_color(rgb(TEXT))
+                .child(div().size(px(10.)).flex_none().rounded_full().bg(rgb(safety::color(verdict))))
+                .child(text),
+        );
+    }
+    legend
+}
+
+/// Which colour means which kind, for the kinds in view. Hover a kind to highlight it.
+/// `in_row`: a row under the chart, rather than a list in its corner.
+fn render_legend(r: &Results, in_row: bool, cx: &mut Context<Petal>) -> gpui::Div {
+    let mut legend = legend_box(in_row);
     for category in CATEGORIES.into_iter().filter(|&c| r.segments.iter().any(|s| r.category(s.target) == Some(c))) {
         let lit = r.legend_hover.is_none_or(|h| h == category);
         legend = legend.child(

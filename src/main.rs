@@ -10,6 +10,7 @@ mod icons;
 mod live;
 mod motion;
 mod onboarding;
+mod safety;
 mod scan;
 #[cfg(feature = "snapshot")]
 mod snapshot;
