@@ -29,22 +29,25 @@ level deeper, and the size of a slice is how much space it takes. Prefer bars or
 picture also comes as an icicle or a treemap. It draws the picture *while* it reads, tells you which
 big folders are safe to clear, and tells you exactly how much deleting them will free.
 
-## How Petal differs from DaisyDisk
+## What Petal tells you
 
-Petal is inspired by [DaisyDisk](https://daisydiskapp.com), which pioneered the sunburst disk explorer
-on the Mac and is still actively maintained. Petal is an independent project, not affiliated with it.
-DaisyDisk is the better-known, more mature app. Petal tries to do a few things differently:
+When a scan finishes, Petal lists the space hogs it found, largest first. Here are three of them as
+Petal shows them (the sizes are only examples):
 
-- **It tells you what's safe to delete, and why.** Known space hogs are labelled **Safe to delete** or
-  **Review first**, each with a one-line explanation of what the folder is.
-- **It tells you exactly what deleting your selection frees.** On APFS, deleting a cloned or
-  hard-linked file may free nothing. Petal counts clones and hard links once when it works out what a
-  finding or your Collector selection frees, and this is checked by a test that deletes real files on
-  a throwaway APFS volume and compares the space actually freed. The chart's sizes count hard links
-  once too; like Finder, they show each clone at its full allocated size.
-- **It draws while it reads.** The chart appears in the first second and fills in as the scan goes,
-  as a sunburst, an icicle or a treemap.
-- **It's free, open source (MIT) and offline.** No account, no network access, no analytics.
+| Finding | Label | Why, in Petal's words | What you get back |
+|---|---|---|---|
+| Xcode build files | **Safe to delete** | Xcode rebuilds these when you next build | What deleting the folder frees, e.g. 14.2 GB |
+| Downloads | **Review first** | Old installers and archives tend to pile up here | Whatever you pick out of it: click the finding to open the folder |
+| Unpacked Git data | **Review first** | In 3 repos; `git gc` packs it | Petal deletes nothing here; it copies the `git gc` commands for you to paste in Terminal |
+
+For findings you can delete, the size is what deleting them *really* frees, which on APFS isn't
+always the folder's size. Say you have a 1 GB video and a copy of it made with Finder's
+**Duplicate**. That copy is a clone: the two files share the same blocks on disk. Delete just one
+and you get almost nothing back; delete both and you get 1 GB, once. Petal works this out for those
+findings and for whatever you put in the Collector, counting clones and hard links once. A test
+that deletes real files on a throwaway APFS volume checks this against the space actually freed. The
+chart's sizes count hard links once too; like Finder, they show each clone at its full allocated
+size.
 
 ## Highlights
 
@@ -65,9 +68,8 @@ DaisyDisk is the better-known, more mature app. Petal tries to do a few things d
   Movies, Mail, `node_modules`, Chrome's update leftovers, Git repositories bloated with unpacked
   objects) and labels each **Safe to delete** or **Review first**, with a one-line explanation. For
   Git repositories Petal copies the `git gc` commands for you rather than deleting anything. The first ones show up within a fraction of a second.
-- **Savings you can trust.** On APFS, deleting a cloned or hard-linked file may free nothing. Petal
-  works out what deleting your selection *really* frees, counting clones and hard links once, and
-  this is tested against real deletions on a throwaway APFS volume.
+- **Savings you can trust.** Petal quotes what deleting your selection *really* frees, counting APFS
+  clones and hard links once ([how it works](#what-petal-tells-you)).
 - **Snapshots and purgeable space.** On the startup disk Petal lists the APFS snapshots that keep
   deleted files' space in use, and can delete Time Machine's (macOS asks for your password). It also
   shows how much space is *purgeable*, meaning macOS frees it by itself when it needs room.
@@ -288,7 +290,8 @@ across updates.
 
 ## Credits
 
-- Inspired by DaisyDisk (see [How Petal differs from DaisyDisk](#how-petal-differs-from-daisydisk)).
+- Inspired by [DaisyDisk](https://daisydiskapp.com), which pioneered the sunburst disk explorer on
+  the Mac. Petal is an independent project, not affiliated with it.
 - Built on [GPUI CE](https://github.com/gpui-ce/gpui-ce), [rayon](https://github.com/rayon-rs/rayon),
   [palette](https://github.com/Ogeon/palette) and [trash](https://github.com/Byron/trash-rs).
 - The promo video was edited in Tesseract with motion graphics made in
