@@ -1,12 +1,14 @@
 mod admin;
 mod app;
 mod classify;
+mod cli;
 mod clock;
 mod dirlist;
 mod disk;
 mod eta;
 mod findings;
 mod icons;
+mod json;
 mod live;
 mod motion;
 mod onboarding;
@@ -32,6 +34,11 @@ actions!(petal, [Quit, Hide, HideOthers, ShowAll, Minimize, Zoom, CloseWindow]);
 fn main() {
     let _ = app::LAUNCHED.set(std::time::Instant::now());
     let args: Vec<String> = std::env::args().collect();
+    // Windowless commands for scripts and agents: `petal scan PATH [--json]` and
+    // `petal findings [PATH] [--json]` (see `cli`).
+    if let Some(command @ ("scan" | "findings")) = args.get(1).map(String::as_str) {
+        std::process::exit(cli::main(command, &args[2..]));
+    }
     // Headless benchmark: `petal --bench-scan <path> [runs]`
     if args.get(1).map(String::as_str) == Some("--bench-scan") {
         let path = PathBuf::from(args.get(2).expect("path required"));
