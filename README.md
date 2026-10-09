@@ -60,9 +60,11 @@ size.
 - **Fast.** A whole Mac (about 6 million files) in roughly 25 seconds; a typical home folder in a few
   seconds; a 90,000-item folder in under a second. Directory listings use `getattrlistbulk` and
   `openat` across all cores. The [performance notes](docs/PERFORMANCE.md) have the measurements.
-- **Exact.** Sizes are allocated blocks, so they match Finder's "on disk". For the startup disk, every
-  other APFS volume (macOS itself, Preboot, VM, Recovery…) gets an exact slice, so the chart adds
-  up to the disk's used space **to the byte**.
+- **Exact.** Sizes are allocated blocks, so they match Finder's "on disk", and hard links count once.
+  For the startup disk, every other APFS volume (macOS itself, Preboot, VM, Recovery…) gets an exact
+  slice, so the chart adds up to the disk's used space. The exception is APFS clones: like Finder,
+  the chart shows each clone at its full size, so files that share blocks can add up to more than
+  the disk really uses.
 - **Findings.** Petal checks the usual suspects first (Trash, Downloads, Xcode build files and
   archives, iOS device support and simulators, iPhone backups, Docker, app caches, npm, Cargo, Gradle,
   Movies, Mail, `node_modules`, Chrome's update leftovers, Git repositories bloated with unpacked
@@ -149,7 +151,7 @@ cargo run --release
 ### Full Disk Access
 
 macOS keeps some folders private (Mail, Messages, Safari, other apps' data) unless an app has Full
-Disk Access. Petal works without it, but shows exactly how much it couldn't read, and offers a button
+Disk Access. Petal works without it, but shows how much it couldn't read, and offers a button
 that opens **System Settings › Privacy & Security › Full Disk Access**. Turn Petal on there; the card
 in Petal notices within a couple of seconds and offers to rescan.
 
