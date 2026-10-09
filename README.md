@@ -40,6 +40,9 @@ Petal shows them (the sizes are only examples):
 | Downloads | **Review first** | Old installers and archives tend to pile up here | Whatever you pick out of it: click the finding to open the folder |
 | Unpacked Git data | **Review first** | In 3 repos; `git gc` packs it | Petal deletes nothing here; it copies the `git gc` commands for you to paste in Terminal |
 
+A third label, **Manage in app**, marks data an app looks after itself, such as Docker's disk image
+or your Claude Code history; Petal explains it but never offers it for the Trash.
+
 For findings you can delete, the size is what deleting them *really* frees, which on APFS isn't
 always the folder's size. Say you have a 1 GB video and a copy of it made with Finder's
 **Duplicate**. That copy is a clone: the two files share the same blocks on disk. Delete just one
@@ -66,10 +69,14 @@ size.
   the chart shows each clone at its full size, so files that share blocks can add up to more than
   the disk really uses.
 - **Findings.** Petal checks the usual suspects first (Trash, Downloads, Xcode build files and
-  archives, iOS device support and simulators, iPhone backups, Docker, app caches, npm, Cargo, Gradle,
-  Movies, Mail, `node_modules`, Chrome's update leftovers, Git repositories bloated with unpacked
-  objects) and labels each **Safe to delete** or **Review first**, with a one-line explanation. For
-  Git repositories Petal copies the `git gc` commands for you rather than deleting anything. The first ones show up within a fraction of a second.
+  archives, iOS device support and simulators, iPhone backups, Docker's disk image, app caches,
+  Homebrew, npm, the pnpm store, Cargo, Gradle, Movies, Mail, `node_modules`, Cargo `target` folders,
+  local AI models from Ollama, LM Studio and Hugging Face, Claude Code and Codex histories, Chrome's
+  update leftovers, Git repositories bloated with unpacked objects) and labels each **Safe to
+  delete**, **Review first** or **Manage in app**, with a one-line explanation. "Manage in app"
+  items are never offered for the Trash. Where a tool has its own way to clean up (`git gc`, `brew
+  cleanup`, `pnpm store prune`, `docker system prune`), Petal copies the command for you rather than
+  deleting anything. The first ones show up within a fraction of a second.
 - **Savings you can trust.** Petal quotes what deleting your selection *really* frees, counting APFS
   clones and hard links once ([how it works](#what-petal-tells-you)).
 - **Snapshots and purgeable space.** On the startup disk Petal lists the APFS snapshots that keep

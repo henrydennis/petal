@@ -47,6 +47,8 @@ const DANGER: u32 = 0xe5484d;
 const ACCENT_TINT: u32 = 0x4f9dff1f;
 const SAFE: u32 = 0x3fb950;
 const WARNING: u32 = 0xd29922;
+/// Findings that belong to an app ("Manage in app"): not for the Trash.
+const MANAGE: u32 = 0xa371f7;
 
 const ROW_HEIGHT: f32 = 30.0;
 
@@ -594,7 +596,7 @@ impl Results {
         let set = self.collected_set();
         self.findings
             .iter()
-            .map(|f| f.fix == Fix::Trash && !f.nodes.is_empty() && f.nodes.iter().all(|&n| is_covered(&self.tree, &set, n)))
+            .map(|f| f.collectable() && !f.nodes.is_empty() && f.nodes.iter().all(|&n| is_covered(&self.tree, &set, n)))
             .collect()
     }
 
@@ -610,7 +612,7 @@ impl Results {
             }
             f.nodes.retain(|&n| !is_covered(tree, trashed, n));
             f.size = match f.fix {
-                Fix::Trash => f.nodes.iter().map(|&n| tree.nodes[n].size).sum(),
+                Fix::Trash | Fix::Command(_) | Fix::InApp => f.nodes.iter().map(|&n| tree.nodes[n].size).sum(),
                 Fix::GitGc => f.nodes.iter().map(|&n| findings::loose_objects_size(tree, n)).sum(),
             };
             f.pending = false;
@@ -2428,18 +2430,20 @@ impl Petal {
         collected: &[bool],
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let safe: u64 = findings.iter().filter(|f| f.safety == Safety::Safe).map(|f| f.size).sum();
+        let safe = findings::safe_total(findings);
         let mut list = div().id("findings").max_h(px(250.)).overflow_y_scroll().flex().flex_col().gap_0p5();
         for (i, finding) in findings.iter().enumerate() {
             let (tag, color) = match finding.safety {
                 Safety::Safe => ("Safe to delete", SAFE),
                 Safety::Review => ("Review first", WARNING),
+                Safety::ManageInApp => ("Manage in app", MANAGE),
             };
             let target = finding.nodes.first().copied().filter(|_| finding.path.is_some());
             let nodes = finding.nodes.clone();
             let uncollect = finding.nodes.clone();
             let in_collector = collected.get(i).copied().unwrap_or(false);
             let fix = finding.fix;
+            let collectable = finding.collectable();
             list = list.child(
                 div()
                     .id(("finding", i))
@@ -2453,6 +2457,8 @@ impl Petal {
                     .when(interactive && target.is_some(), |d| {
                         d.cursor_pointer().hover(|s| s.bg(rgb(CARD_HOVER))).on_click(cx.listener(move |this, _, _, cx| {
                             if let (Some(r), Some(ix)) = (this.results(), target) {
+                                // A file (Docker's disk image) opens the folder it's in.
+                                let ix = if r.tree.nodes[ix].kind == Kind::Dir { ix } else { r.tree.nodes[ix].parent.unwrap_or(ix) };
                                 r.navigate(ix);
                                 cx.notify();
                             }
@@ -2492,7 +2498,21 @@ impl Petal {
                                         })),
                                 )
                             })
-                            .when(interactive && fix == Fix::Trash && !in_collector, |d| {
+                            .when_some(match fix {
+                                Fix::Command(command) if interactive => Some(command),
+                                _ => None,
+                            }, |d, command| {
+                                d.child(
+                                    icon_button(("copy-command", i), "⧉", "Copy Command")
+                                        .invisible()
+                                        .group_hover("finding", |s| s.visible())
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.copy_to_clipboard(command.to_string(), format!("Copied `{command}`: paste it in Terminal"), cx);
+                                        })),
+                                )
+                            })
+                            .when(interactive && collectable && !in_collector, |d| {
                                 d.child(
                                     icon_button(("collect-finding", i), "+", "Add to Collector")
                                         .invisible()
@@ -2929,7 +2949,7 @@ impl Petal {
         let banner = r.banner.is_some().then(|| {
             let total = tree.nodes[Tree::ROOT].size;
             let pending = r.findings.iter().any(|f| f.pending);
-            let safe: u64 = r.findings.iter().filter(|f| f.safety == Safety::Safe).map(|f| f.size).sum();
+            let safe = findings::safe_total(&r.findings);
             let savings = if pending {
                 " · working out savings…".to_string()
             } else if safe > 0 {
