@@ -5,9 +5,9 @@
 <h1 align="center">Petal</h1>
 
 <p align="center">
-  <b>See what's filling your Mac. In seconds.</b><br>
-  A fast, exact disk-space explorer for macOS with a live sunburst chart.<br>
-  Free and open source, written in Rust with a GPU-rendered native UI.
+  <b>Petal tells you what's safe to delete on your Mac, why, and exactly what you'll get back.</b><br>
+  A fast disk-space explorer for macOS that understands APFS clones, hard links, snapshots and purgeable space.<br>
+  Free and open source, works offline, written in Rust with a GPU-rendered native UI.
 </p>
 
 <p align="center">
@@ -29,6 +29,29 @@ level deeper, and the size of a slice is how much space it takes. Prefer bars or
 picture also comes as an icicle or a treemap. It draws the picture *while* it reads, tells you which
 big folders are safe to clear, and tells you exactly how much deleting them will free.
 
+## What Petal tells you
+
+When a scan finishes, Petal lists the space hogs it found, largest first. Here are three of them as
+Petal shows them (the sizes are only examples):
+
+| Finding | Label | Why, in Petal's words | What you get back |
+|---|---|---|---|
+| Xcode build files | **Safe to delete** | Xcode rebuilds these when you next build | What deleting the folder frees, e.g. 14.2 GB |
+| Downloads | **Review first** | Old installers and archives tend to pile up here | Whatever you pick out of it: click the finding to open the folder |
+| Unpacked Git data | **Review first** | In 3 repos; `git gc` packs it | Petal deletes nothing here; it copies the `git gc` commands for you to paste in Terminal |
+
+A third label, **Manage in app**, marks data an app looks after itself, such as Docker's disk image
+or your Claude Code history; Petal explains it but never offers it for the Trash.
+
+For findings you can delete, the size is what deleting them *really* frees, which on APFS isn't
+always the folder's size. Say you have a 1 GB video and a copy of it made with Finder's
+**Duplicate**. That copy is a clone: the two files share the same blocks on disk. Delete just one
+and you get almost nothing back; delete both and you get 1 GB, once. Petal works this out for those
+findings and for whatever you put in the Collector, counting clones and hard links once. A test
+that deletes real files on a throwaway APFS volume checks this against the space actually freed. The
+chart's sizes count hard links once too; like Finder, they show each clone at its full allocated
+size.
+
 ## Highlights
 
 - **Live from the first second.** The chart appears straight away and fills in as Petal reads. Folders
@@ -40,17 +63,22 @@ big folders are safe to clear, and tells you exactly how much deleting them will
 - **Fast.** A whole Mac (about 6 million files) in roughly 25 seconds; a typical home folder in a few
   seconds; a 90,000-item folder in under a second. Directory listings use `getattrlistbulk` and
   `openat` across all cores. The [performance notes](docs/PERFORMANCE.md) have the measurements.
-- **Exact.** Sizes are allocated blocks, so they match Finder's "on disk". For the startup disk, every
-  other APFS volume (macOS itself, Preboot, VM, Recovery…) gets an exact slice, so the chart adds
-  up to the disk's used space **to the byte**.
+- **Exact.** Sizes are allocated blocks, so they match Finder's "on disk", and hard links count once.
+  For the startup disk, every other APFS volume (macOS itself, Preboot, VM, Recovery…) gets an exact
+  slice, so the chart adds up to the disk's used space. The exception is APFS clones: like Finder,
+  the chart shows each clone at its full size, so files that share blocks can add up to more than
+  the disk really uses.
 - **Findings.** Petal checks the usual suspects first (Trash, Downloads, Xcode build files and
-  archives, iOS device support and simulators, iPhone backups, Docker, app caches, npm, Cargo, Gradle,
-  Movies, Mail, `node_modules`, Chrome's update leftovers, Git repositories bloated with unpacked
-  objects) and labels each **Safe to delete** or **Review first**, with a one-line explanation. For
-  Git repositories Petal copies the `git gc` commands for you rather than deleting anything. The first ones show up within a fraction of a second.
-- **Savings you can trust.** On APFS, deleting a cloned or hard-linked file may free nothing. Petal
-  works out what deleting your selection *really* frees, counting clones and hard links once, and
-  this is tested against real deletions on a throwaway APFS volume.
+  archives, iOS device support and simulators, iPhone backups, Docker's disk image, app caches,
+  Homebrew, npm, the pnpm store, Cargo, Gradle, Movies, Mail, `node_modules`, Cargo `target` folders,
+  local AI models from Ollama, LM Studio and Hugging Face, Claude Code and Codex histories, Chrome's
+  update leftovers, Git repositories bloated with unpacked objects) and labels each **Safe to
+  delete**, **Review first** or **Manage in app**, with a one-line explanation. "Manage in app"
+  items are never offered for the Trash. Where a tool has its own way to clean up (`git gc`, `brew
+  cleanup`, `pnpm store prune`, `docker system prune`), Petal copies the command for you rather than
+  deleting anything. The first ones show up within a fraction of a second.
+- **Savings you can trust.** Petal quotes what deleting your selection *really* frees, counting APFS
+  clones and hard links once ([how it works](#what-petal-tells-you)).
 - **Snapshots and purgeable space.** On the startup disk Petal lists the APFS snapshots that keep
   deleted files' space in use, and can delete Time Machine's (macOS asks for your password). It also
   shows how much space is *purgeable*, meaning macOS frees it by itself when it needs room.
@@ -130,7 +158,7 @@ cargo run --release
 ### Full Disk Access
 
 macOS keeps some folders private (Mail, Messages, Safari, other apps' data) unless an app has Full
-Disk Access. Petal works without it, but shows exactly how much it couldn't read, and offers a button
+Disk Access. Petal works without it, but shows how much it couldn't read, and offers a button
 that opens **System Settings › Privacy & Security › Full Disk Access**. Turn Petal on there; the card
 in Petal notices within a couple of seconds and offers to rescan.
 
@@ -170,7 +198,8 @@ on the **Disks** screen, with your volumes, **Scan Home Folder** and **Choose Fo
 - **Chart** in the toolbar draws the same folders as a sunburst, icicle or treemap; **Colour** colours
   them by folder or by kind.
 - **Colour: Safety** colours what the findings cover: green if safe to delete, amber if worth a
-  review first. Everything else is grey, which means no finding covers it, not that it's safe.
+  review first, purple if it's for its app to manage. Everything else is grey, which means no
+  finding covers it, not that it's safe.
 - **Click a finding** to open its folder in the chart; press **+** on it to collect it.
 - In the list, **⌕** reveals an item in Finder and **+** adds it to the Collector.
 - **Move to Trash…** asks for confirmation, moves the collected items to the Trash, and updates every
@@ -188,6 +217,100 @@ on the **Disks** screen, with your volumes, **Scan Home Folder** and **Choose Fo
 | ⌘Q | Quit |
 
 You can also pass a folder on the command line: `petal ~/Library`.
+
+## Command line
+
+Two commands work without opening a window, for scripts and coding agents. Add `--json` for
+machine-readable output; without it they print a short summary.
+
+```bash
+petal scan ~/Library --json                  # sizes of a folder and what's in it
+petal scan ~/Library --json --depth 3 --top 10
+petal findings --json                        # findings in your home folder
+petal findings ~/code --json                 # findings in another folder
+```
+
+From the app bundle, run `/Applications/Petal.app/Contents/MacOS/petal`. (A folder called `scan`
+or `findings` in the current folder now needs `./`: `petal ./scan` opens it in the app.)
+
+- `--depth N` lists N levels of folders below the scanned folder (default 2).
+- `--top N` lists the N largest items in each folder (default 20). The rest are added up into one
+  `"other"` entry, so a folder's entries always add up to its size.
+- Invalid arguments print the usage on stderr and exit with status 2. A folder that's missing or
+  can't be read prints a plain message on stderr (never JSON) and exits with status 1.
+
+**Sizes.** Every size is a whole number of bytes, and is *allocated* size (blocks on disk, like
+Finder's "on disk"). A file with several hard links is counted once. An APFS clone is counted at its
+full allocation in scan sizes, as Finder counts it. `frees_bytes` is different: it's what deleting
+all of a finding would really free, so clone data shared with files outside it, and hard-linked
+files with links outside it, free nothing and aren't counted.
+
+**Text.** Output is UTF-8. A name that isn't valid UTF-8 has its invalid bytes replaced with U+FFFD
+(`�`), so such a path can't be used to open the file.
+
+**Stability.** `schema_version` is 1. Fields may be added in any release, so ignore fields you don't
+know. Fields are never removed or renamed, nor their meaning changed, without increasing
+`schema_version`.
+
+### `petal scan PATH --json`
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema_version` | integer | Version of this schema: 1 |
+| `petal_version` | string | Petal's version, such as `"0.5.0"` |
+| `command` | string | `"scan"` |
+| `root` | string | The folder scanned, as an absolute path. Scanning `/` reads the startup disk's Data volume, so this is where it's mounted (usually `/System/Volumes/Data`) |
+| `size_bytes` | integer | Total size. For the startup disk this includes the other APFS volumes and what couldn't be read, so it matches the disk's used space |
+| `files` | integer | Files counted (each name of a hard-linked file counts) |
+| `folders` | integer | Folders inside `root` |
+| `errors` | integer | Entries that couldn't be read |
+| `unreadable` | array | Folders that couldn't be read: `{"path": string, "whole": bool}`; `whole` is false when only some entries in it failed |
+| `cloud_only_folders` | integer | iCloud folders whose contents are only in the cloud, which Petal skips rather than downloads |
+| `purgeable_bytes` | integer or null | Space macOS can free by itself, when `root` is a whole volume |
+| `snapshots` | array | On the startup disk, its APFS snapshots: `{"name": string, "created": integer}` (seconds since 1970) |
+| `depth`, `top` | integer | The limits used |
+| `tree` | entry | The scanned folder, as an entry |
+
+Each entry has:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `name` | string | File or folder name |
+| `path` | string or null | Absolute path; null for `slice` and `other` |
+| `kind` | string | `"folder"`, `"file"`, `"slice"` (space with nothing to open, such as the macOS volume or "Not readable" on the startup disk) or `"other"` (smaller items added up) |
+| `size_bytes` | integer | Size, including everything inside |
+| `files` | integer | Files inside (1 for a file) |
+| `own_bytes` | integer | Folders whose contents are listed: the folder's own allocation, so `own_bytes` plus the children's `size_bytes` equals `size_bytes` |
+| `children` | array | Folders above the depth limit: their contents, largest first, at most `top` entries plus one `other` |
+| `count` | integer | `other` entries only: how many items were added up |
+
+### `petal findings [PATH] --json`
+
+`PATH` defaults to your home folder, as in the app. Working out `frees_bytes` reads the findings'
+folders again, so this takes a little longer than a scan.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema_version`, `petal_version` | | As for `scan` |
+| `command` | string | `"findings"` |
+| `root` | string | The folder scanned |
+| `min_size_bytes` | integer | Findings whose allocated size is below this are left out (50 MB) |
+| `findings` | array | Largest first |
+
+Each finding has:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `id` | string | Stable machine name, such as `"xcode_build_files"`, `"node_modules"` or `"unpacked_git_data"`. A tool that keeps its data in more than one place (LM Studio, pnpm) can have a finding for each, with the same id |
+| `title` | string | What the app shows, such as `"Xcode build files"` |
+| `explanation` | string | The app's one-line explanation |
+| `safety` | string | `"safe"` (rebuilt or downloaded again when needed), `"review"` (look first: it may hold things you want) or `"manage_in_app"` (it belongs to an app, such as Docker's disk image or your Claude Code conversations: clear it there, never delete it) |
+| `action` | string | `"trash"` (delete its folders), `"git_gc"` (run the `commands`; never delete a `.git` folder), `"command"` (run the tool's own command in `commands`, such as `brew cleanup --prune=all`, rather than deleting the folder) or `"in_app"` (manage it in its app; nothing to run). More may be added |
+| `collectable` | boolean | Whether the app offers its folders for the Trash: true only for `"trash"` |
+| `paths` | array of strings | Every folder involved |
+| `allocated_bytes` | integer | Allocated size of its folders (for `git_gc`, of the repositories' loose objects) |
+| `frees_bytes` | integer or null | Exactly what deleting all of `paths` would free; null unless `collectable` |
+| `commands` | array of strings | Shell commands to run instead of deleting: `git gc` for each repository, or the one command for `"command"`; empty otherwise |
 
 ## How it works
 
