@@ -1,5 +1,33 @@
 # petal
 
+## 0.5.0
+
+### Minor Changes
+
+- 0e0d603: New findings for AI tools and developers, and a third label, **Manage in app**, for things that belong to an app. These are shown and explained but never offered for the Trash.
+  
+  - **Local AI models** from Ollama, LM Studio and Hugging Face are marked Review first. They're downloads you'd have to fetch again, and the explanation points to each tool's own way to remove them (`ollama rm <model>`, LM Studio's model list, Hugging Face's `hf cache` commands). For Hugging Face only the `hub` folder is included, because the folder above it also holds your login token.
+  - **Claude Code and Codex histories** (`~/.claude/projects`, `~/.codex/sessions`) are marked Manage in app. They're your conversations, kept so you can resume them.
+  - **Cargo `target` folders** are Safe to delete, but only when the folder sits right next to a `Cargo.toml`. Any other folder called `target` isn't reported, and, as with `node_modules`, nothing inside apps, `~/Library` or hidden folders is ever included.
+  - **Homebrew's downloads** are Safe to delete. Petal copies `brew cleanup --prune=all` for you rather than deleting the folder.
+  - **The pnpm store** is marked Review first. Your projects' `node_modules` share its files through hard links or clones, so Petal shows only what deleting the store would really free, and copies `pnpm store prune` for you.
+  - **Docker's disk image** replaces the old Docker finding. It's a sparse file, so Petal counts the space it really takes, not its much larger apparent size. It's marked Manage in app, and Petal copies `docker system prune` for you; Docker's own settings can also shrink it.
+  - The "safe to delete" total no longer counts a finding twice when one sits inside another (Homebrew's downloads are inside App caches).
+- f5e5b00: Read protected folders as an administrator, see APFS snapshots, and see purgeable space.
+  
+  - **Read Protected Folders as Administrator…** (File menu, or the card that appears when some folders couldn't be read) reads the folders that belong to macOS or other users, after macOS asks for an administrator's password. Only those folders are read again, and their sizes slot into the results in place, with no rescan. Petal never runs as root itself: a one-off helper reads names and sizes, hands them back and exits.
+  - **APFS snapshots.** On the startup disk, Petal lists the Data volume's snapshots (Time Machine, macOS updates, other apps) with their dates. APFS doesn't report how much space each snapshot holds, so when there are snapshots the remainder slice is called "Snapshots and unreadable". Time Machine's local snapshots can be deleted from the card (macOS asks for a password), and Petal then shows how much that freed.
+  - **Purgeable space**, the space macOS frees by itself when it needs room, is shown on the Disks screen and at the top of the results.
+- c3e0669: Colour the chart by safety, and show how big a folder's smaller objects are.
+  
+  - **Colour: Safety** colours each folder a finding covers, and everything inside it: green for safe to delete, amber for review first, purple for manage in app. Everything else stays grey, because no finding says anything about it, which doesn't make it safe. A folder that only holds findings stays grey too. A legend explains the colours, and hovering a folder says which finding covers it. It works in the sunburst, icicle and treemap.
+  - **Smaller objects.** The segment that stands for a folder's too-small files is now see-through, so it can't be mistaken for a file, and hovering it shows how many things it holds and exactly how much space they take together. The idea is from Taras Brizitsky's "Sunburst — An interactive guide".
+- af5f7fd: Scan folders and list findings from the command line, with JSON output for scripts and coding agents.
+  
+  - **`petal scan PATH --json`** prints the folder's size, file and folder counts, unreadable folders and a tree of what's inside. `--depth N` and `--top N` keep the output short: the smaller items in each folder are added up into one "other" entry, so the sizes always add up.
+  - **`petal findings --json`** scans your home folder (or `petal findings PATH --json`) and prints each finding with its id, whether it's safe to delete, worth a look first or managed in its app, its explanation, its folders, its allocated size and, for what can go in the Trash, exactly what deleting it frees. Findings cleared another way say so: Git repositories come with their `git gc` commands, Homebrew downloads, the pnpm store and Docker's disk image with the command that clears them, and "Manage in app" findings such as your Claude Code history with nothing to delete.
+  - Without `--json`, both print a short summary. Neither opens a window. The README describes the JSON schema, which has a `schema_version` so scripts can rely on it.
+
 ## 0.4.1
 
 ### Patch Changes
