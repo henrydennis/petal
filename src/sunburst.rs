@@ -17,15 +17,20 @@ use crate::scan::{Kind, Tree};
 pub const MAX_DEPTH: usize = 6;
 /// Children thinner than this are merged into a single "smaller objects" segment.
 pub(crate) const MIN_TURNS: f32 = 0.004;
+/// How opaque a "smaller objects" segment is: it looks like a file, but see-through, so it
+/// can't be mistaken for one.
+pub const SMALL_ALPHA: f32 = 0.5;
 const RING_FALLOFF: f32 = 0.84;
 const GAP_PX: f32 = 1.2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
     Node(usize),
-    /// Aggregated tiny children of `parent`, a run of them starting at `first`. (A folder
-    /// can have several runs when its children aren't sorted by size, as mid-scan.)
-    Small { parent: usize, first: usize },
+    /// Aggregated tiny children of `parent`, a run of `count` of them starting at `first`,
+    /// `size` bytes in all. (A folder can have several runs when its children aren't sorted
+    /// by size, as mid-scan.) It stands for things too small to show, so it can't be opened
+    /// or collected.
+    Small { parent: usize, first: usize, count: usize, size: u64 },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -67,14 +72,18 @@ fn layout_children(tree: &Tree, ix: usize, depth: usize, max_depth: usize, start
     let span = end - start;
     let total = node.size as f64;
     let mut angle = start;
-    // Thin children are merged into one "smaller objects" sliver. Children are sorted
-    // largest first, except slices pinned to the end (e.g. "Not scanned yet"), so keep
-    // going after the thin ones: anything large after them still gets its own segment.
-    let mut small: Option<(f32, f32, usize)> = None;
-    let flush = |small: &mut Option<(f32, f32, usize)>, out: &mut Vec<Segment>| {
-        if let Some((from, width, first)) = small.take() {
-            if width >= MIN_TURNS / 2.0 {
-                out.push(Segment { target: Target::Small { parent: ix, first }, depth, start: from, end: from + width, kind: Kind::File });
+    // Thin children are merged into one "smaller objects" sliver, rather than left out, so
+    // a folder of many small files still shows how much they add up to. (The idea is from
+    // Taras Brizitsky's "Sunburst — An interactive guide",
+    // https://tbrizitsky.github.io/Sunburst-article/.) Children are sorted largest first,
+    // except slices pinned to the end (e.g. "Not scanned yet"), so keep going after the thin
+    // ones: anything large after them still gets its own segment.
+    let mut small: Option<Run> = None;
+    let flush = |small: &mut Option<Run>, out: &mut Vec<Segment>| {
+        if let Some(run) = small.take() {
+            if run.width >= MIN_TURNS / 2.0 {
+                let target = Target::Small { parent: ix, first: run.first, count: run.count, size: run.size };
+                out.push(Segment { target, depth, start: run.from, end: run.from + run.width, kind: Kind::File });
             }
         }
     };
@@ -82,8 +91,10 @@ fn layout_children(tree: &Tree, ix: usize, depth: usize, max_depth: usize, start
         let child = &tree.nodes[child_ix];
         let width = (span as f64 * child.size as f64 / total) as f32;
         if width < MIN_TURNS {
-            let run = small.get_or_insert((angle, 0.0, child_ix));
-            run.1 += width;
+            let run = small.get_or_insert(Run { from: angle, width: 0.0, first: child_ix, count: 0, size: 0 });
+            run.width += width;
+            run.count += 1;
+            run.size += child.size;
             angle += width;
             continue;
         }
@@ -101,6 +112,16 @@ fn layout_children(tree: &Tree, ix: usize, depth: usize, max_depth: usize, start
         angle += width;
     }
     flush(&mut small, out);
+}
+
+/// A run of children too thin to draw, being merged into one "smaller objects" segment.
+struct Run {
+    /// Where it starts, and how wide it is so far, in turns.
+    from: f32,
+    width: f32,
+    first: usize,
+    count: usize,
+    size: u64,
 }
 
 /// Where `node` sits in the chart centred on `ancestor`: its angles, and its ring
@@ -128,7 +149,7 @@ pub fn frame_of(tree: &Tree, ancestor: usize, node: usize) -> Option<(f32, f32, 
 pub fn base_color(segment: &Segment) -> Hsla {
     let d = (segment.depth - 1) as f32;
     match (segment.target, segment.kind) {
-        (Target::Small { .. }, _) => hsla(0.0, 0.0, 0.38, 1.0),
+        (Target::Small { .. }, _) => hsla(0.0, 0.0, 0.50 + d * 0.02, SMALL_ALPHA),
         (_, Kind::File) => hsla(segment.hue(), 0.10, 0.50 + d * 0.02, 1.0),
         (_, Kind::Other) => hsla(0.0, 0.0, 0.45, 1.0),
         (_, Kind::Dir) => hsla(segment.hue(), 0.70 - d * 0.06, 0.52 + d * 0.035, 1.0),
@@ -151,22 +172,22 @@ fn hue_turns(color: &Hsla) -> f32 {
 }
 
 pub fn highlight(color: Hsla) -> Hsla {
-    hsla(hue_turns(&color), (color.saturation + 0.1).min(1.0), (color.lightness + 0.14).min(0.9), 1.0)
+    hsla(hue_turns(&color), (color.saturation + 0.1).min(1.0), (color.lightness + 0.14).min(0.9), color.alpha)
 }
 
 pub fn dim(color: Hsla) -> Hsla {
-    hsla(hue_turns(&color), color.saturation * 0.8, color.lightness * 0.82, 1.0)
+    hsla(hue_turns(&color), color.saturation * 0.8, color.lightness * 0.82, color.alpha)
 }
 
 /// Highlight for colours that are already vivid (colouring by kind): lighter, without
 /// pushing saturation, which turns a pure green neon.
 pub fn lift(color: Hsla) -> Hsla {
-    hsla(hue_turns(&color), color.saturation.min(0.8), (color.lightness + 0.1).min(0.85), 1.0)
+    hsla(hue_turns(&color), color.saturation.min(0.8), (color.lightness + 0.1).min(0.85), color.alpha)
 }
 
 /// Much quieter than `dim`, so one highlighted group stands out from everything else.
 pub fn fade(color: Hsla) -> Hsla {
-    hsla(hue_turns(&color), color.saturation * 0.3, color.lightness * 0.6, 1.0)
+    hsla(hue_turns(&color), color.saturation * 0.3, color.lightness * 0.6, color.alpha)
 }
 
 /// Room left around the icicle: the app draws its hover label in the strip along the top.
@@ -664,6 +685,81 @@ mod tests {
 
         let (start, end, ring) = frame_of(&tree, Tree::ROOT, 5).unwrap();
         assert!((start - last.start).abs() < 1e-4 && (end - last.end).abs() < 1e-4 && ring == 1.0);
+    }
+
+    /// A folder of `sizes`, as files, under the root.
+    fn flat(sizes: &[u64]) -> Tree {
+        let mut nodes = vec![node("root", sizes.iter().sum(), Kind::Dir, None, (1..=sizes.len()).collect())];
+        nodes.extend(sizes.iter().enumerate().map(|(i, &size)| node(&format!("f{i}"), size, Kind::File, Some(0), Vec::new())));
+        Tree { root_path: PathBuf::from("/"), nodes, errors: 0, cloud_only: 0, ..Default::default() }
+    }
+
+    /// Too-thin children aren't dropped: they're shown together, with exactly their combined
+    /// size and how many there are, so everything adds up to the folder.
+    #[test]
+    fn smaller_objects_add_up_exactly() {
+        // 600 + 300, then 100 files of 1 byte: each a thousandth of a turn, under the cut-off.
+        let mut sizes = vec![600, 300];
+        sizes.extend([1; 100]);
+        let tree = flat(&sizes);
+        let segments = layout(&tree, Tree::ROOT);
+        assert_eq!((segments[0].target, segments[1].target), (Target::Node(1), Target::Node(2)));
+        let small: Vec<_> = segments.iter().filter(|s| matches!(s.target, Target::Small { .. })).collect();
+        assert_eq!(small.len(), 1, "{segments:?}");
+        assert_eq!(small[0].target, Target::Small { parent: Tree::ROOT, first: 3, count: 100, size: 100 });
+        assert!((small[0].start - 0.9).abs() < 1e-4 && (small[0].end - 1.0).abs() < 1e-4, "{:?}", small[0]);
+        let shown: u64 = segments
+            .iter()
+            .map(|s| match s.target {
+                Target::Node(ix) => tree.nodes[ix].size,
+                Target::Small { size, .. } => size,
+            })
+            .sum();
+        assert_eq!(shown, tree.nodes[Tree::ROOT].size);
+        // It looks like a file, without colour, but see-through.
+        let color = base_color(small[0]);
+        assert!(color.saturation == 0.0 && color.alpha == SMALL_ALPHA && SMALL_ALPHA < 1.0);
+        // And stays see-through when highlighted or dimmed.
+        assert_eq!(highlight(color).alpha, SMALL_ALPHA);
+        assert_eq!(dim(color).alpha, SMALL_ALPHA);
+    }
+
+    /// Exactly what's thinner than `MIN_TURNS` is merged; everything else keeps its segment.
+    #[test]
+    fn smaller_objects_respect_the_cut_off() {
+        // Out of 10 000: 50 is half a hundredth of a turn, over the cut-off (0.004); 30 is under.
+        let tree = flat(&[9_000, 500, 50, 50, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 10]);
+        let segments = layout(&tree, Tree::ROOT);
+        for s in &segments {
+            if let Target::Node(ix) = s.target {
+                assert!(s.end - s.start >= MIN_TURNS, "{s:?}");
+                assert!(tree.nodes[ix].size >= 50);
+            }
+        }
+        let nodes = segments.iter().filter(|s| matches!(s.target, Target::Node(_))).count();
+        assert_eq!(nodes, 4);
+        assert_eq!(segments.last().unwrap().target, Target::Small { parent: Tree::ROOT, first: 5, count: 14, size: 400 });
+        // Deeper in, the cut-off is the folder's share of the turn, and the run is that folder's.
+        let mut nodes = vec![node("root", 1_000, Kind::Dir, None, vec![1, 2]), node("big", 500, Kind::Dir, Some(0), vec![3, 4, 5, 6])];
+        nodes.push(node("other", 500, Kind::File, Some(0), Vec::new()));
+        for (name, size) in [("a", 497), ("b", 1), ("c", 1), ("d", 1)] {
+            nodes.push(node(name, size, Kind::File, Some(1), Vec::new()));
+        }
+        let tree = Tree { root_path: PathBuf::from("/"), nodes, errors: 0, cloud_only: 0, ..Default::default() };
+        let segments = layout(&tree, Tree::ROOT);
+        let small = segments.iter().find(|s| matches!(s.target, Target::Small { .. })).expect("smaller objects in `big`");
+        assert_eq!((small.target, small.depth), (Target::Small { parent: 1, first: 4, count: 3, size: 3 }, 2));
+        // A run thinner than half the cut-off is too thin to see at all, and is left out.
+        let tree = flat(&[100_000, 1]);
+        assert_eq!(layout(&tree, Tree::ROOT).iter().map(|s| s.target).collect::<Vec<_>>(), [Target::Node(1)]);
+    }
+
+    #[test]
+    fn nothing_is_merged_when_everything_is_big_enough() {
+        let tree = flat(&[400, 300, 200, 100]);
+        let segments = layout(&tree, Tree::ROOT);
+        assert_eq!(segments.iter().map(|s| s.target).collect::<Vec<_>>(), (1..=4).map(Target::Node).collect::<Vec<_>>());
+        assert!((segments.last().unwrap().end - 1.0).abs() < 1e-5);
     }
 
     /// Cut short at one level, the layout is `layout`'s top level, segment for segment.
