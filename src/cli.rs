@@ -269,8 +269,8 @@ fn scan_summary(tree: &Tree, top: usize) -> String {
     out
 }
 
-/// A finding with its folders' paths and, for findings that are deleted, exactly what
-/// deleting all of it frees.
+/// A finding with its folders' paths and exactly what deleting all of them frees (none
+/// for `git gc`, whose folders must never be deleted).
 pub struct Resolved {
     pub finding: Finding,
     pub paths: Vec<PathBuf>,
@@ -285,8 +285,10 @@ fn resolve_findings(tree: &Tree) -> Vec<Resolved> {
         .into_iter()
         .map(|finding| {
             let paths: Vec<PathBuf> = finding.nodes.iter().map(|&ix| tree.path_of(ix)).collect();
-            // `git gc` packs a repository's loose objects rather than deleting folders.
-            let frees = (finding.fix == Fix::Trash).then(|| scan::frees_of(&paths));
+            // `git gc` packs a repository's loose objects rather than deleting folders. The
+            // others are worked out as the app does, so a pnpm store counts only what no
+            // project links to.
+            let frees = (finding.fix != Fix::GitGc).then(|| scan::frees_of(&paths));
             Resolved { finding, paths, frees }
         })
         .collect();
@@ -315,6 +317,7 @@ fn safety_name(safety: Safety) -> &'static str {
     match safety {
         Safety::Safe => "safe",
         Safety::Review => "review",
+        Safety::ManageInApp => "manage_in_app",
     }
 }
 
@@ -330,16 +333,22 @@ pub fn findings_json(root: &Path, found: &[Resolved]) -> Json {
                     "git_gc",
                     findings::git_gc_commands(&r.paths).lines().map(|line| Json::Str(line.to_string())).collect(),
                 ),
+                Fix::Command(command) => ("command", vec![Json::Str(command.to_string())]),
+                Fix::InApp => ("in_app", Vec::new()),
             };
+            // Only what Petal would move to the Trash has a saving to report: the rest is
+            // cleared by a command or in its app, which free some other amount.
+            let frees = if f.collectable() { r.frees } else { None };
             Json::Object(vec![
                 ("id", Json::Str(finding_id(f.title))),
                 ("title", Json::Str(f.title.to_string())),
                 ("explanation", Json::Str(f.blurb.clone())),
                 ("safety", Json::Str(safety_name(f.safety).into())),
                 ("action", Json::Str(action.into())),
+                ("collectable", Json::Bool(f.collectable())),
                 ("paths", Json::Array(r.paths.iter().map(|p| Json::lossy(p.as_os_str())).collect())),
                 ("allocated_bytes", Json::Int(f.allocated)),
-                ("frees_bytes", r.frees.map_or(Json::Null, Json::Int)),
+                ("frees_bytes", frees.map_or(Json::Null, Json::Int)),
                 ("commands", Json::Array(commands)),
             ])
         })
@@ -365,6 +374,7 @@ fn findings_summary(root: &Path, found: &[Resolved]) -> String {
         let label = match f.safety {
             Safety::Safe => "Safe",
             Safety::Review => "Review",
+            Safety::ManageInApp => "Manage",
         };
         let size = r.frees.unwrap_or(f.size);
         out.push_str(&format!("  {label:<6}  {:>10}  {}: {}\n", format_size(size), f.title, f.blurb));
@@ -534,6 +544,16 @@ mod tests {
                 paths: vec!["/home/me/a/.git".into(), "/home/me/it's/.git".into()],
                 frees: None,
             },
+            Resolved {
+                finding: finding("Docker disk image", Safety::ManageInApp, Fix::Command("docker system prune"), 400),
+                paths: vec!["/home/me/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw".into()],
+                frees: Some(400),
+            },
+            Resolved {
+                finding: finding("Claude Code history", Safety::ManageInApp, Fix::InApp, 300),
+                paths: vec!["/home/me/.claude/projects".into()],
+                frees: Some(300),
+            },
         ];
         let json = findings_json(Path::new("/home/me"), &found);
         assert_eq!(json.get("schema_version").and_then(Json::as_u64), Some(1));
@@ -544,6 +564,7 @@ mod tests {
         assert_eq!(caches.get("id").and_then(Json::as_str), Some("app_caches"));
         assert_eq!(caches.get("safety").and_then(Json::as_str), Some("safe"));
         assert_eq!(caches.get("action").and_then(Json::as_str), Some("trash"));
+        assert_eq!(caches.get("collectable"), Some(&Json::Bool(true)));
         assert_eq!(caches.get("explanation").and_then(Json::as_str), Some("About App caches"));
         assert_eq!(caches.get("allocated_bytes").and_then(Json::as_u64), Some(900));
         assert_eq!(caches.get("frees_bytes").and_then(Json::as_u64), Some(800));
@@ -551,6 +572,7 @@ mod tests {
         let git = &list[1];
         assert_eq!(git.get("safety").and_then(Json::as_str), Some("review"));
         assert_eq!(git.get("action").and_then(Json::as_str), Some("git_gc"));
+        assert_eq!(git.get("collectable"), Some(&Json::Bool(false)));
         assert_eq!(git.get("frees_bytes"), Some(&Json::Null));
         assert_eq!(
             git.get("commands"),
@@ -560,12 +582,61 @@ mod tests {
             ]))
         );
         assert_eq!(git.get("paths").and_then(Json::as_array).map(|p| p.len()), Some(2));
+
+        // Cleared with the tool's own command, never trashed: no saving to report.
+        let docker = &list[2];
+        assert_eq!(docker.get("id").and_then(Json::as_str), Some("docker_disk_image"));
+        assert_eq!(docker.get("safety").and_then(Json::as_str), Some("manage_in_app"));
+        assert_eq!(docker.get("action").and_then(Json::as_str), Some("command"));
+        assert_eq!(docker.get("collectable"), Some(&Json::Bool(false)));
+        assert_eq!(docker.get("frees_bytes"), Some(&Json::Null));
+        assert_eq!(docker.get("allocated_bytes").and_then(Json::as_u64), Some(400));
+        assert_eq!(docker.get("commands"), Some(&Json::Array(vec![Json::Str("docker system prune".into())])));
+
+        // Managed in its app: nothing to trash or run.
+        let history = &list[3];
+        assert_eq!(history.get("safety").and_then(Json::as_str), Some("manage_in_app"));
+        assert_eq!(history.get("action").and_then(Json::as_str), Some("in_app"));
+        assert_eq!(history.get("collectable"), Some(&Json::Bool(false)));
+        assert_eq!(history.get("frees_bytes"), Some(&Json::Null));
+        assert_eq!(history.get("commands"), Some(&Json::Array(Vec::new())));
+    }
+
+    /// The action and command each catalog location gets in the JSON.
+    #[test]
+    fn catalog_commands_appear_in_json() {
+        let found: Vec<Resolved> = findings::CATALOG
+            .iter()
+            .map(|c| Resolved { finding: finding(c.title, c.safety, c.fix, 100), paths: vec![c.path.into()], frees: Some(100) })
+            .collect();
+        let json = findings_json(Path::new("/home/me"), &found);
+        let list = json.get("findings").and_then(Json::as_array).unwrap();
+        let get = |id: &str, key: &str| {
+            let entry = list.iter().find(|f| f.get("id").and_then(Json::as_str) == Some(id)).unwrap_or_else(|| panic!("{id}"));
+            entry.get(key).cloned().unwrap()
+        };
+        let commands = |id: &str| get(id, "commands");
+        assert_eq!(commands("homebrew_downloads"), Json::Array(vec![Json::Str("brew cleanup --prune=all".into())]));
+        assert_eq!(commands("pnpm_store"), Json::Array(vec![Json::Str("pnpm store prune".into())]));
+        assert_eq!(get("homebrew_downloads", "safety"), Json::Str("safe".into()));
+        assert_eq!(get("pnpm_store", "safety"), Json::Str("review".into()));
+        assert_eq!(get("codex_history", "action"), Json::Str("in_app".into()));
+        assert_eq!(get("npm_cache", "action"), Json::Str("trash".into()));
+        assert_eq!(get("npm_cache", "frees_bytes"), Json::Int(100));
+        for entry in list {
+            // Only trashed findings report a saving, and only they can be collected.
+            let collectable = entry.get("collectable") == Some(&Json::Bool(true));
+            assert_eq!(entry.get("action") == Some(&Json::Str("trash".into())), collectable, "{entry:?}");
+            assert_eq!(entry.get("frees_bytes") != Some(&Json::Null), collectable, "{entry:?}");
+        }
     }
 
     /// Ids are part of the JSON schema: renaming a finding mustn't change its id silently.
+    /// A tool that keeps its data in more than one place (LM Studio, pnpm) has one id for
+    /// all of them, but different findings never share one.
     #[test]
     fn finding_ids_are_stable_and_unique() {
-        let mut ids: Vec<String> = findings::CATALOG.iter().map(|c| finding_id(c.title)).collect();
+        let ids: Vec<String> = findings::CATALOG.iter().map(|c| finding_id(c.title)).collect();
         assert_eq!(
             ids,
             [
@@ -576,23 +647,37 @@ mod tests {
                 "ios_device_support",
                 "ios_simulators",
                 "iphone_ipad_backups",
-                "docker",
+                "docker_disk_image",
+                "ollama_models",
+                "lm_studio_models",
+                "lm_studio_models",
+                "hugging_face_models",
                 "app_caches",
+                "homebrew_downloads",
                 "npm_cache",
+                "pnpm_store",
+                "pnpm_store",
+                "pnpm_store",
                 "cargo_registry",
                 "gradle_caches",
                 "movies",
                 "chrome_update_leftovers",
                 "mail",
+                "claude_code_history",
+                "codex_history",
             ]
         );
         assert_eq!(finding_id("node_modules"), "node_modules");
         assert_eq!(finding_id("Unpacked Git data"), "unpacked_git_data");
-        ids.extend(["node_modules".into(), "unpacked_git_data".into()]);
-        let count = ids.len();
-        ids.sort();
-        ids.dedup();
-        assert_eq!(ids.len(), count);
+        assert_eq!(finding_id("Cargo build files"), "cargo_build_files");
+        let mut titles: Vec<&str> = findings::CATALOG.iter().map(|c| c.title).collect();
+        titles.extend(["node_modules", "Unpacked Git data", "Cargo build files"]);
+        titles.sort();
+        titles.dedup();
+        let mut unique: Vec<String> = titles.iter().map(|t| finding_id(t)).collect();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), titles.len(), "two findings share an id");
     }
 
     #[test]

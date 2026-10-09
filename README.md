@@ -292,21 +292,22 @@ folders again, so this takes a little longer than a scan.
 | `command` | string | `"findings"` |
 | `root` | string | The folder scanned |
 | `min_size_bytes` | integer | Findings whose allocated size is below this are left out (50 MB) |
-| `findings` | array | Largest saving first |
+| `findings` | array | Largest first |
 
 Each finding has:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `id` | string | Stable machine name, such as `"xcode_build_files"`, `"node_modules"` or `"unpacked_git_data"` |
+| `id` | string | Stable machine name, such as `"xcode_build_files"`, `"node_modules"` or `"unpacked_git_data"`. A tool that keeps its data in more than one place (LM Studio, pnpm) can have a finding for each, with the same id |
 | `title` | string | What the app shows, such as `"Xcode build files"` |
 | `explanation` | string | The app's one-line explanation |
-| `safety` | string | `"safe"` (rebuilt or downloaded again when needed) or `"review"` (look first: it may hold things you want) |
-| `action` | string | `"trash"` (delete its folders) or `"git_gc"` (run the `commands`; never delete a `.git` folder) |
+| `safety` | string | `"safe"` (rebuilt or downloaded again when needed), `"review"` (look first: it may hold things you want) or `"manage_in_app"` (it belongs to an app, such as Docker's disk image or your Claude Code conversations: clear it there, never delete it) |
+| `action` | string | `"trash"` (delete its folders), `"git_gc"` (run the `commands`; never delete a `.git` folder), `"command"` (run the tool's own command in `commands`, such as `brew cleanup --prune=all`, rather than deleting the folder) or `"in_app"` (manage it in its app; nothing to run). More may be added |
+| `collectable` | boolean | Whether the app offers its folders for the Trash: true only for `"trash"` |
 | `paths` | array of strings | Every folder involved |
 | `allocated_bytes` | integer | Allocated size of its folders (for `git_gc`, of the repositories' loose objects) |
-| `frees_bytes` | integer or null | Exactly what deleting all of `paths` would free; null for `git_gc` |
-| `commands` | array of strings | Shell commands to run instead of deleting (`git gc` for each repository); empty otherwise |
+| `frees_bytes` | integer or null | Exactly what deleting all of `paths` would free; null unless `collectable` |
+| `commands` | array of strings | Shell commands to run instead of deleting: `git gc` for each repository, or the one command for `"command"`; empty otherwise |
 
 ## How it works
 
