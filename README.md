@@ -5,9 +5,9 @@
 <h1 align="center">Petal</h1>
 
 <p align="center">
-  <b>See what's filling your Mac. In seconds.</b><br>
-  A fast, exact disk-space explorer for macOS with a live sunburst chart.<br>
-  Free and open source, written in Rust with a GPU-rendered native UI.
+  <b>Petal tells you what's safe to delete on your Mac, why, and exactly what you'll get back.</b><br>
+  A fast disk-space explorer for macOS that understands APFS clones, hard links, snapshots and purgeable space.<br>
+  Free and open source, works offline, written in Rust with a GPU-rendered native UI.
 </p>
 
 <p align="center">
@@ -29,6 +29,26 @@ level deeper, and the size of a slice is how much space it takes. Prefer bars or
 picture also comes as an icicle or a treemap. It draws the picture *while* it reads, tells you which
 big folders are safe to clear, and tells you exactly how much deleting them will free.
 
+## What Petal tells you
+
+When a scan finishes, Petal lists the space hogs it found, largest first. Here are three of them as
+Petal shows them (the sizes are only examples):
+
+| Finding | Label | Why, in Petal's words | What you get back |
+|---|---|---|---|
+| Xcode build files | **Safe to delete** | Xcode rebuilds these when you next build | What deleting the folder frees, e.g. 14.2 GB |
+| Downloads | **Review first** | Old installers and archives tend to pile up here | Whatever you pick out of it: click the finding to open the folder |
+| Unpacked Git data | **Review first** | In 3 repos; `git gc` packs it | Petal deletes nothing here; it copies the `git gc` commands for you to paste in Terminal |
+
+For findings you can delete, the size is what deleting them *really* frees, which on APFS isn't
+always the folder's size. Say you have a 1 GB video and a copy of it made with Finder's
+**Duplicate**. That copy is a clone: the two files share the same blocks on disk. Delete just one
+and you get almost nothing back; delete both and you get 1 GB, once. Petal works this out for those
+findings and for whatever you put in the Collector, counting clones and hard links once. A test
+that deletes real files on a throwaway APFS volume checks this against the space actually freed. The
+chart's sizes count hard links once too; like Finder, they show each clone at its full allocated
+size.
+
 ## Highlights
 
 - **Live from the first second.** The chart appears straight away and fills in as Petal reads. Folders
@@ -40,17 +60,18 @@ big folders are safe to clear, and tells you exactly how much deleting them will
 - **Fast.** A whole Mac (about 6 million files) in roughly 25 seconds; a typical home folder in a few
   seconds; a 90,000-item folder in under a second. Directory listings use `getattrlistbulk` and
   `openat` across all cores. The [performance notes](docs/PERFORMANCE.md) have the measurements.
-- **Exact.** Sizes are allocated blocks, so they match Finder's "on disk". For the startup disk, every
-  other APFS volume (macOS itself, Preboot, VM, Recovery…) gets an exact slice, so the chart adds
-  up to the disk's used space **to the byte**.
+- **Exact.** Sizes are allocated blocks, so they match Finder's "on disk", and hard links count once.
+  For the startup disk, every other APFS volume (macOS itself, Preboot, VM, Recovery…) gets an exact
+  slice, so the chart adds up to the disk's used space. The exception is APFS clones: like Finder,
+  the chart shows each clone at its full size, so files that share blocks can add up to more than
+  the disk really uses.
 - **Findings.** Petal checks the usual suspects first (Trash, Downloads, Xcode build files and
   archives, iOS device support and simulators, iPhone backups, Docker, app caches, npm, Cargo, Gradle,
   Movies, Mail, `node_modules`, Chrome's update leftovers, Git repositories bloated with unpacked
   objects) and labels each **Safe to delete** or **Review first**, with a one-line explanation. For
   Git repositories Petal copies the `git gc` commands for you rather than deleting anything. The first ones show up within a fraction of a second.
-- **Savings you can trust.** On APFS, deleting a cloned or hard-linked file may free nothing. Petal
-  works out what deleting your selection *really* frees, counting clones and hard links once, and
-  this is tested against real deletions on a throwaway APFS volume.
+- **Savings you can trust.** Petal quotes what deleting your selection *really* frees, counting APFS
+  clones and hard links once ([how it works](#what-petal-tells-you)).
 - **Snapshots and purgeable space.** On the startup disk Petal lists the APFS snapshots that keep
   deleted files' space in use, and can delete Time Machine's (macOS asks for your password). It also
   shows how much space is *purgeable*, meaning macOS frees it by itself when it needs room.
@@ -130,7 +151,7 @@ cargo run --release
 ### Full Disk Access
 
 macOS keeps some folders private (Mail, Messages, Safari, other apps' data) unless an app has Full
-Disk Access. Petal works without it, but shows exactly how much it couldn't read, and offers a button
+Disk Access. Petal works without it, but shows how much it couldn't read, and offers a button
 that opens **System Settings › Privacy & Security › Full Disk Access**. Turn Petal on there; the card
 in Petal notices within a couple of seconds and offers to rescan.
 
