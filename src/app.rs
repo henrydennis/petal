@@ -2090,13 +2090,9 @@ impl Petal {
         }
 
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        div()
-            .flex_1()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
+        let page = div()
             .gap_6()
+            .py_8()
             .child(
                 div()
                     .flex()
@@ -2131,7 +2127,8 @@ impl Petal {
                         .text_center()
                         .child("Tip: grant Full Disk Access in System Settings › Privacy & Security to include protected folders."),
                 )
-            })
+            });
+        centred_scroll("start", page)
     }
 
     fn render_scanning(&self, scanning: &Scanning, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3422,6 +3419,18 @@ fn disk_gauge(fraction: f32) -> impl IntoElement {
     .flex_none()
 }
 
+/// A page whose content sits in the middle when it fits and scrolls when it doesn't: the
+/// start page with many disks mounted, or in a short window. `justify_center` alone would
+/// push the overflow above the top, out of reach, so the content is centred inside a box
+/// at least as tall as the scroll area instead.
+fn centred_scroll(id: &'static str, page: gpui::Div) -> Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .size_full()
+        .overflow_y_scroll()
+        .child(page.min_h_full().flex().flex_col().items_center().justify_center())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3432,5 +3441,60 @@ mod tests {
         assert_eq!(civil_from_days(20_730), (2026, 10, 4));
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
         assert_eq!(format_date(946_684_800), "1 Jan 2000");
+    }
+}
+
+/// Layout checks that need GPUI's test platform, which only the `snapshot` feature turns on:
+/// `cargo test --features snapshot`.
+#[cfg(all(test, feature = "snapshot"))]
+mod layout_tests {
+    use super::*;
+    use gpui::{ScrollHandle, TestAppContext};
+
+    struct Page {
+        cards: usize,
+        scroll: ScrollHandle,
+    }
+
+    impl Render for Page {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let cards = (0..self.cards).map(|i| div().debug_selector(move || format!("card-{i}")).w(px(560.)).h(px(80.)));
+            // The same nesting as the window: a flex column with the content below a toolbar.
+            div().size_full().flex().flex_col().child(div().h(px(40.))).child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(centred_scroll("start", div().gap_3().children(cards)).track_scroll(&self.scroll).debug_selector(|| "page".into())),
+            )
+        }
+    }
+
+    fn draw(cards: usize, cx: &mut TestAppContext) -> (ScrollHandle, Bounds<Pixels>, Bounds<Pixels>) {
+        let scroll = ScrollHandle::new();
+        let (_, cx) = cx.add_window_view({
+            let scroll = scroll.clone();
+            move |_, _| Page { cards, scroll }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let page = cx.debug_bounds("page").expect("page wasn't drawn");
+        let first = cx.debug_bounds("card-0").expect("first card wasn't drawn");
+        (scroll, page, first)
+    }
+
+    #[gpui::test]
+    fn many_disks_scroll_from_the_first(cx: &mut TestAppContext) {
+        // Far taller than any test window.
+        let (scroll, page, first) = draw(200, cx);
+        assert!(scroll.max_offset().y > px(0.), "the list doesn't scroll");
+        // Centring mustn't push the first disk above the top, where scrolling can't reach it.
+        assert!(first.top() >= page.top(), "first disk at {:?}, above the page at {:?}", first.top(), page.top());
+    }
+
+    #[gpui::test]
+    fn a_few_disks_stay_centred(cx: &mut TestAppContext) {
+        let (scroll, page, first) = draw(1, cx);
+        assert_eq!(scroll.max_offset().y, px(0.));
+        assert!(first.top() > page.top() + px(100.), "a lone disk should sit in the middle, not at the top");
     }
 }
