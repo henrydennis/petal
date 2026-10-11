@@ -19,3 +19,5 @@ jobs:
         run: cargo test --release
       - name: Build with the recorder (snapshot feature)
         run: cargo build --release --features snapshot
+      - name: Test with the GPUI test platform (snapshot feature)
+        run: cargo test --release --features snapshot
